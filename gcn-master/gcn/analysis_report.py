@@ -801,14 +801,6 @@ def plot_memory_bandwidth_comparison(perf_dir, analysis_run_dir):
             'Testing': os.path.join(perf_dir, 'testing_memory_stats.txt')
         }
         
-        # 获取前向和后向传播的统计目录
-        forward_dir = os.path.join(perf_dir, 'forward')
-        backward_dir = os.path.join(perf_dir, 'backward')
-        
-        # 读取所有前向和后向传播的统计文件
-        forward_files = sorted(glob.glob(os.path.join(forward_dir, 'forward_stats_*.txt')))
-        backward_files = sorted(glob.glob(os.path.join(backward_dir, 'backward_stats_*.txt')))
-        
         # 解析各个阶段的统计
         stage_bandwidths = {}
         for stage_name, file_path in stage_files.items():
@@ -817,28 +809,12 @@ def plot_memory_bandwidth_comparison(perf_dir, analysis_run_dir):
                 if stats:
                     stage_bandwidths[stage_name] = stats.get('memory_bandwidth_mb_per_sec', 0)
         
-        # 解析前向和后向传播的统计
-        forward_bandwidths = []
-        backward_bandwidths = []
-        
-        for f_file in forward_files:
-            stats = parse_perf_stats(f_file)
-            if stats:
-                forward_bandwidths.append(stats.get('memory_bandwidth_mb_per_sec', 0))
-                
-        for b_file in backward_files:
-            stats = parse_perf_stats(b_file)
-            if stats:
-                backward_bandwidths.append(stats.get('memory_bandwidth_mb_per_sec', 0))
-        
-        # 计算前向和后向传播的平均带宽
-        if forward_bandwidths:
-            stage_bandwidths['Forward Propagation'] = np.mean(forward_bandwidths)
-        if backward_bandwidths:
-            stage_bandwidths['Backward Propagation'] = np.mean(backward_bandwidths)
-        
+        if not stage_bandwidths:
+            print("No valid stage statistics found")
+            return
+            
         # 创建柱状图
-        plt.figure(figsize=(15, 8))
+        plt.figure(figsize=(12, 6))
         
         # 设置柱状图的位置和宽度
         x = np.arange(len(stage_bandwidths))
@@ -879,21 +855,6 @@ def plot_memory_bandwidth_comparison(perf_dir, analysis_run_dir):
             for stage, bandwidth in stage_bandwidths.items():
                 f.write(f"{stage}:\n")
                 f.write(f"- Bandwidth: {bandwidth:.2f} MB/s ({bandwidth/1024:.2f} GB/s)\n\n")
-            
-            if forward_bandwidths and backward_bandwidths:
-                f.write("\nPropagation Bandwidth Statistics:\n")
-                f.write(f"Forward Propagation:\n")
-                f.write(f"- Average: {np.mean(forward_bandwidths):.2f} MB/s\n")
-                f.write(f"- Min: {np.min(forward_bandwidths):.2f} MB/s\n")
-                f.write(f"- Max: {np.max(forward_bandwidths):.2f} MB/s\n\n")
-                
-                f.write(f"Backward Propagation:\n")
-                f.write(f"- Average: {np.mean(backward_bandwidths):.2f} MB/s\n")
-                f.write(f"- Min: {np.min(backward_bandwidths):.2f} MB/s\n")
-                f.write(f"- Max: {np.max(backward_bandwidths):.2f} MB/s\n\n")
-                
-                ratio = np.mean(forward_bandwidths) / np.mean(backward_bandwidths)
-                f.write(f"Forward/Backward Bandwidth Ratio: {ratio:.2f}\n")
         
         print(f"Generated memory bandwidth report: {report_path}")
             
