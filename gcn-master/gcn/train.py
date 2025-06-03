@@ -56,13 +56,15 @@ class PerfStage:
 
     def start(self):
         self.start_time = time.time()
-        # 触发perf记录开始
-        os.system(f'echo "PERF_STAGE_START {self.name}" > /dev/null')
+        # 写入阶段开始信号
+        with open('/tmp/perf_stage_signal', 'w') as f:
+            f.write(f"PERF_STAGE_START {self.name}")
 
     def end(self):
         self.end_time = time.time()
-        # 触发perf记录结束
-        os.system(f'echo "PERF_STAGE_END {self.name}" > /dev/null')
+        # 写入阶段结束信号
+        with open('/tmp/perf_stage_signal', 'w') as f:
+            f.write(f"PERF_STAGE_END {self.name}")
         self.metrics['duration'] = self.end_time - self.start_time
 
 # Load data
@@ -153,12 +155,29 @@ for epoch in range(FLAGS.epochs):
     # Training step
     train_stage = PerfStage(f'epoch_{epoch}_training')
     train_stage.start()
+
+    # Forward pass
+    forward_stage = PerfStage(f'epoch_{epoch}_forward')
+    forward_stage.start()
     feed_dict = construct_feed_dict(features, support, y_train, train_mask, placeholders)
     feed_dict.update({placeholders['dropout']: FLAGS.dropout})
-    outs = sess.run([model.opt_op, model.loss, model.accuracy], 
+    # 只运行前向传播，不更新参数
+    outputs = sess.run([model.outputs, model.loss, model.accuracy], 
+                      feed_dict=feed_dict,
+                      options=run_options,
+                      run_metadata=run_metadata)
+    forward_stage.end()
+
+    # Backward pass
+    backward_stage = PerfStage(f'epoch_{epoch}_backward')
+    backward_stage.start()
+    # 运行优化器更新参数
+    outs = sess.run([model.opt_op], 
                    feed_dict=feed_dict,
                    options=run_options,
                    run_metadata=run_metadata)
+    backward_stage.end()
+
     train_stage.end()
     train_times.append(train_stage.metrics['duration'])
 
@@ -176,22 +195,26 @@ for epoch in range(FLAGS.epochs):
     # Store epoch statistics
     epoch_stats.append({
         'epoch': epoch + 1,
-        'train_loss': float(outs[1]),
-        'train_acc': float(outs[2]),
+        'train_loss': float(outputs[1]),
+        'train_acc': float(outputs[2]),
         'val_loss': float(cost),
         'val_acc': float(acc),
         'train_time': float(train_stage.metrics['duration']),
+        'forward_time': float(forward_stage.metrics['duration']),
+        'backward_time': float(backward_stage.metrics['duration']),
         'val_time': float(val_stage.metrics['duration']),
         'total_time': float(epoch_stage.metrics['duration'])
     })
 
     # Print results
     print("Epoch:", '%04d' % (epoch + 1), 
-          "train_loss=", "{:.5f}".format(outs[1]),
-          "train_acc=", "{:.5f}".format(outs[2]), 
+          "train_loss=", "{:.5f}".format(outputs[1]),
+          "train_acc=", "{:.5f}".format(outputs[2]), 
           "val_loss=", "{:.5f}".format(cost),
           "val_acc=", "{:.5f}".format(acc), 
           "train_time=", "{:.5f}".format(train_stage.metrics['duration']),
+          "forward_time=", "{:.5f}".format(forward_stage.metrics['duration']),
+          "backward_time=", "{:.5f}".format(backward_stage.metrics['duration']),
           "val_time=", "{:.5f}".format(val_stage.metrics['duration']),
           "total_time=", "{:.5f}".format(epoch_stage.metrics['duration']))
 
@@ -262,7 +285,7 @@ print(f"\nResults saved to {results_file}")
 print(f"Profiling data saved to {FLAGS.profile_dir}")
 print(f"Profile report saved to {os.path.join(profile_reports_run_dir, 'profile_report.txt')}")
 
-# 等待一段时间，让perf_analysis.py完成数据收集
-print("\nWaiting for performance analysis to complete...")
-time.sleep(30)  # 等待30秒
-print("Done waiting.")
+# # 等待一段时间，让perf_analysis.py完成数据收集
+# print("\nWaiting for performance analysis to complete...")
+# time.sleep(30)  # 等待30秒
+# print("Done waiting.")

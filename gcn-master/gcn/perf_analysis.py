@@ -43,7 +43,11 @@ def get_memory_events():
         'dTLB-load-misses',
         'dTLB-loads',
         'iTLB-loads',
-        'iTLB-load-misses'
+        'iTLB-load-misses',
+        
+        # 内存访问事件 (用于估算带宽)
+        'cpu/mem-loads/',
+        'cpu/mem-stores/'
     ]
 
 def calculate_hit_rates(stats_file):
