@@ -261,3 +261,8 @@ with open(results_file, 'w') as f:
 print(f"\nResults saved to {results_file}")
 print(f"Profiling data saved to {FLAGS.profile_dir}")
 print(f"Profile report saved to {os.path.join(profile_reports_run_dir, 'profile_report.txt')}")
+
+# 等待一段时间，让perf_analysis.py完成数据收集
+print("\nWaiting for performance analysis to complete...")
+time.sleep(30)  # 等待30秒
+print("Done waiting.")

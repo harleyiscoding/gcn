@@ -128,7 +128,8 @@ def parse_perf_stats(file_path):
         with open(file_path, 'r') as f:
             content = f.read()
             
-        # 定义要提取的指标
+        # 定义要提取的指标，包括时间、指令、分支预测和内存访问相关的
+        # 添加 cpu/mem-loads 和 cpu/mem-stores 事件
         metrics = [
             'cache-references',
             'cache-misses',
@@ -137,27 +138,92 @@ def parse_perf_stats(file_path):
             'L1-dcache-stores',
             'L1-icache-load-misses',
             'LLC-loads',
-            'LLC-load-misses'
+            'LLC-load-misses',
+            'instructions',
+            'cpu-cycles',
+            'branch-misses',
+            'branch-loads',
+            'cpu/mem-loads',  # Added memory load event
+            'cpu/mem-stores', # Added memory store event
         ]
-        
+
         # 提取每个指标的值
         for metric in metrics:
-            pattern = rf'(\d+(?:,\d+)*)\s+{metric}'
+            # 使用通用的模式匹配数值和指标名称
+            # 需要处理带有斜杠的事件名称，并考虑可能的单位和百分比信息
+            # 尝试匹配以数值开头，后面跟指标名称的模式
+            pattern = rf'(\d+(?:,\d+)*)\s+{re.escape(metric)}.*' # Use re.escape for metrics with special chars like /
             match = re.search(pattern, content)
             if match:
                 # 移除逗号并转换为整数
                 value = int(match.group(1).replace(',', ''))
                 stats[metric] = value
             else:
-                stats[metric] = 0
+                # 如果找不到精确匹配，尝试查找包含指标名称的行并提取数值
+                # This might be less precise but can handle variations in perf output format
+                fuzzy_pattern = rf'(\d+(?:,\d+)*).*{re.escape(metric)}.*'
+                fuzzy_match = re.search(fuzzy_pattern, content, re.IGNORECASE)
+                if fuzzy_match:
+                     value = int(fuzzy_match.group(1).replace(',', ''))
+                     stats[metric] = value
+                else:
+                    stats[metric] = 0
                 
-        # 计算缺失率
-        if stats['cache-references'] > 0:
+        # 提取执行时间
+        time_match = re.search(r'(\d+\.\d+)\s+seconds time elapsed', content)
+        if time_match:
+            execution_time = float(time_match.group(1))
+            stats['execution_time'] = execution_time
+        else:
+            # Fallback to task-clock if time elapsed is not found
+            task_clock_match = re.search(r'(\d+\.\d+)\s+task-clock', content)
+            if task_clock_match:
+                execution_time = float(task_clock_match.group(1))
+                stats['execution_time'] = execution_time / 1000 # task-clock is often in ms
+            else:
+                stats['execution_time'] = 0
+                print("Warning: Could not extract execution time from perf stat output.")
+
+        # 计算缺失率和IPC
+        if stats.get('cache-references', 0) > 0:
             stats['cache_miss_rate'] = stats['cache-misses'] / stats['cache-references'] * 100
-        if stats['L1-dcache-loads'] > 0:
+        else:
+            stats['cache_miss_rate'] = 0
+            
+        if stats.get('L1-dcache-loads', 0) > 0:
             stats['l1_dcache_miss_rate'] = stats['L1-dcache-load-misses'] / stats['L1-dcache-loads'] * 100
-        if stats['LLC-loads'] > 0:
+        else:
+            stats['l1_dcache_miss_rate'] = 0
+
+        if stats.get('LLC-loads', 0) > 0:
             stats['llc_miss_rate'] = stats['LLC-load-misses'] / stats['LLC-loads'] * 100
+        else:
+            stats['llc_miss_rate'] = 0
+            
+        # 计算IPC
+        if stats.get('cpu-cycles', 0) > 0:
+            stats['ipc'] = stats['instructions'] / stats['cpu-cycles']
+        else:
+            stats['ipc'] = 0
+
+        # 计算分支预测错误率
+        if stats.get('branch-loads', 0) > 0:
+            stats['branch_miss_rate'] = stats['branch-misses'] / stats['branch-loads'] * 100
+        else:
+            stats['branch_miss_rate'] = 0
+
+        # 计算内存带宽 (估算)
+        cache_line_size = 64 # Assuming a 64 byte cache line size
+        total_memory_accesses = stats.get('cpu/mem-loads', 0) + stats.get('cpu/mem-stores', 0)
+        estimated_bytes_transferred = total_memory_accesses * cache_line_size
+        execution_time = stats.get('execution_time', 0)
+        
+        stats['estimated_memory_bandwidth_bytes_per_sec'] = 0
+        stats['estimated_memory_bandwidth_gb_per_sec'] = 0
+
+        if execution_time > 0:
+            stats['estimated_memory_bandwidth_bytes_per_sec'] = estimated_bytes_transferred / execution_time
+            stats['estimated_memory_bandwidth_gb_per_sec'] = stats['estimated_memory_bandwidth_bytes_per_sec'] / (1024**3) # Convert to GB/s
             
         return stats
     except Exception as e:
@@ -239,23 +305,54 @@ def plot_cache_miss_rates_epochs(epoch_stats, analysis_run_dir):
 def plot_cache_metrics_stages(stage_stats, analysis_run_dir):
     """绘制各阶段缓存指标折线图"""
     stages = list(stage_stats.keys())
-    metrics = ['cache-references', 'cache-misses', 'L1-dcache-load-misses', 
-              'L1-dcache-loads', 'L1-dcache-stores', 'L1-icache-load-misses',
-              'LLC-loads', 'LLC-load-misses']
     
-    plt.figure(figsize=(15, 8))
-    for metric in metrics:
+    # 定义L1和LLC相关的指标
+    l1_metrics = [
+        'L1-dcache-load-misses',
+        'L1-dcache-loads',
+        'L1-dcache-stores',
+        'L1-icache-load-misses'
+    ]
+    llc_metrics = [
+        'cache-references', # Note: perf's cache-references often refers to LLC
+        'cache-misses',     # Note: perf's cache-misses often refers to LLC
+        'LLC-loads',
+        'LLC-load-misses'
+    ]
+    
+    # 创建包含两个子图的figure
+    fig, axes = plt.subplots(2, 1, figsize=(15, 12), sharex=True)
+    
+    # 绘制L1缓存指标
+    ax1 = axes[0]
+    for metric in l1_metrics:
         values = [stage_stats[stage][metric] for stage in stages]
-        plt.plot(stages, values, marker='o', label=metric)
+        ax1.plot(stages, values, marker='o', label=metric)
     
-    plt.title('Cache Metrics Across Stages')
-    plt.xlabel('Stage')
-    plt.ylabel('Count')
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.grid(True)
-    plt.xticks(rotation=45)
+    ax1.set_ylabel('Count (L1 Cache)')
+    ax1.set_title('L1 Cache Metrics Across Stages')
+    ax1.legend(loc='upper left', bbox_to_anchor=(1, 1))
+    ax1.grid(True)
+    
+    # 绘制LLC缓存指标
+    ax2 = axes[1]
+    for metric in llc_metrics:
+        values = [stage_stats[stage][metric] for stage in stages]
+        ax2.plot(stages, values, marker='o', label=metric)
+    
+    ax2.set_xlabel('Stage')
+    ax2.set_ylabel('Count (LLC)')
+    ax2.set_title('LLC Cache Metrics Across Stages')
+    ax2.legend(loc='upper left', bbox_to_anchor=(1, 1))
+    ax2.grid(True)
+    
+    # 旋转x轴标签，避免重叠
+    plt.xticks(rotation=45, ha='right')
+    
     plt.tight_layout()
-    plt.savefig(os.path.join(analysis_run_dir, 'cache_metrics_stages.png'))
+    
+    # 保存图表到analysis目录
+    plt.savefig(os.path.join(analysis_run_dir, 'cache_metrics_stages_subplots.png'))
     plt.close()
 
 def plot_cache_miss_rates_stages(stage_stats, analysis_run_dir):
@@ -284,6 +381,127 @@ def plot_cache_miss_rates_stages(stage_stats, analysis_run_dir):
     plt.savefig(os.path.join(analysis_run_dir, 'cache_miss_rates_stages.png'))
     plt.close()
 
+def find_latest_perf_dir(perf_base_dir):
+    """找到最新的perf统计目录"""
+    if not os.path.exists(perf_base_dir):
+        raise FileNotFoundError(f"Perf base directory not found: {perf_base_dir}")
+        
+    # 列出所有条目，过滤出目录
+    all_entries = [os.path.join(perf_base_dir, d) for d in os.listdir(perf_base_dir)]
+    timestamp_dirs = sorted([d for d in all_entries if os.path.isdir(d)], key=os.path.getmtime, reverse=True)
+    
+    if not timestamp_dirs:
+        raise FileNotFoundError(f"No timestamped perf directories found in: {perf_base_dir}")
+    
+    latest_timestamp_dir = timestamp_dirs[0]
+    print(f"Found latest perf directory: {latest_timestamp_dir}")
+    return latest_timestamp_dir
+
+def plot_ipc_branch_miss_rate_stages(stage_stats, analysis_run_dir):
+    """绘制各阶段IPC和分支预测错误率折线图"""
+    stages = list(stage_stats.keys())
+    ipcs = [stage_stats[stage]['ipc'] for stage in stages]
+    branch_miss_rates = [stage_stats[stage]['branch_miss_rate'] for stage in stages]
+    
+    plt.figure(figsize=(12, 6))
+    
+    # 绘制IPC
+    plt.plot(stages, ipcs, marker='o', label='Instructions Per Cycle (IPC)')
+    
+    # 绘制分支预测错误率
+    plt.plot(stages, branch_miss_rates, marker='o', label='Branch Miss Rate (%)')
+    
+    plt.title('IPC and Branch Miss Rate Across Stages')
+    plt.xlabel('Stage')
+    plt.ylabel('Value')
+    plt.legend()
+    plt.grid(True)
+    plt.xticks(rotation=45, ha='right')
+    
+    # 设置Y轴下限为0
+    plt.ylim(ymin=0)
+    
+    plt.tight_layout()
+    
+    # 保存图表
+    plt.savefig(os.path.join(analysis_run_dir, 'ipc_branch_miss_rate_stages.png'))
+    plt.close()
+
+def generate_performance_report(timing_stats, epoch_stats, stage_stats, analysis_run_dir):
+    """生成性能指标的文本报告"""
+    # Re-adding the report function to include bandwidth
+    report_path = os.path.join(analysis_run_dir, 'performance_report.txt')
+    
+    with open(report_path, 'w') as f:
+        # 写入时间统计
+        f.write("=== 时间统计 ===\n\n")
+        total_time = sum([
+            timing_stats['data_loading_time'],
+            timing_stats['preprocessing_time'],
+            timing_stats['model_building_time'],
+            timing_stats['total_training_time'],
+            timing_stats['test_time']
+        ])
+        
+        f.write(f"总运行时间: {total_time:.2f} 秒\n\n")
+        f.write("各阶段时间分布:\n")
+        f.write(f"- 数据加载: {timing_stats['data_loading_time']:.2f} 秒 ({timing_stats['data_loading_time']/total_time*100:.1f}%)\n")
+        f.write(f"- 预处理: {timing_stats['preprocessing_time']:.2f} 秒 ({timing_stats['preprocessing_time']/total_time*100:.1f}%)\n")
+        f.write(f"- 模型构建: {timing_stats['model_building_time']:.2f} 秒 ({timing_stats['model_building_time']/total_time*100:.1f}%)\n")
+        f.write(f"- 训练: {timing_stats['total_training_time']:.2f} 秒 ({timing_stats['total_training_time']/total_time*100:.1f}%)\n")
+        f.write(f"- 测试: {timing_stats['test_time']:.2f} 秒 ({timing_stats['test_time']/total_time*100:.1f}%)\n\n")
+        
+        f.write("训练阶段详细时间:\n")
+        f.write(f"- 平均每个epoch时间: {timing_stats['average_epoch_time']:.2f} 秒\n")
+        f.write(f"- 平均训练时间: {timing_stats['average_training_time']:.2f} 秒\n")
+        f.write(f"- 平均验证时间: {timing_stats['average_validation_time']:.2f} 秒\n\n")
+
+        # 写入内存带宽统计 (估算)
+        f.write("=== 内存带宽统计 (估算) ===\n\n")
+        # Assuming stage_stats contains overall stats or use a specific stage like 'training'
+        # If stage_stats keys are stages and each has a perf result:
+        if stage_stats:
+             for stage, stats in stage_stats.items():
+                  f.write(f"{stage}:\n")
+                  f.write(f"- 估算内存加载/存储次数: {stats.get('cpu/mem-loads', 0) + stats.get('cpu/mem-stores', 0):,}\n")
+                  f.write(f"- 执行时间: {stats.get('execution_time', 0):.4f} 秒\n")
+                  f.write(f"- 估算内存带宽: {stats.get('estimated_memory_bandwidth_gb_per_sec', 0):.2f} GB/s\n\n")
+        elif epoch_stats: # If only epoch stats are available, might report average or for a specific epoch
+             # For simplicity, let's just report for the first epoch if stages are not available
+             if epoch_stats:
+                 stats = epoch_stats[0]
+                 f.write(f"Epoch {stats['epoch']}:\n")
+                 f.write(f"- 估算内存加载/存储次数: {stats.get('cpu/mem-loads', 0) + stats.get('cpu/mem-stores', 0):,}\n")
+                 f.write(f"- 执行时间: {stats.get('execution_time', 0):.4f} 秒\n")
+                 f.write(f"- 估算内存带宽: {stats.get('estimated_memory_bandwidth_gb_per_sec', 0):.2f} GB/s\n\n")
+        else:
+            f.write("No performance statistics available to estimate memory bandwidth.\n\n")
+            
+        # 写入缓存统计 (现有代码保留)
+        if epoch_stats:
+            f.write("=== 缓存统计 (按Epoch) ===\n\n")
+            for stat in epoch_stats:
+                f.write(f"Epoch {stat['epoch']}:\n")
+                f.write(f"- 缓存引用: {stat['cache-references']:,}\n")
+                f.write(f"- 缓存缺失: {stat['cache-misses']:,} ({stat['cache_miss_rate']:.1f}%)\n")
+                f.write(f"- L1数据缓存加载: {stat['L1-dcache-loads']:,}\n")
+                f.write(f"- L1数据缓存缺失: {stat['L1-dcache-load-misses']:,} ({stat['l1_dcache_miss_rate']:.1f}%)\n")
+                f.write(f"- LLC加载: {stat['LLC-loads']:,}\n")
+                f.write(f"- LLC缺失: {stat['LLC-load-misses']:,} ({stat['llc_miss_rate']:.1f}%)\n\n")
+        
+        if stage_stats:
+            f.write("=== 缓存统计 (按阶段) ===\n\n")
+            for stage, stat in stage_stats.items():
+                f.write(f"{stage}:\n")
+                f.write(f"- 缓存引用: {stat['cache-references']:,}\n")
+                f.write(f"- 缓存缺失: {stat['cache-misses']:,} ({stat['cache_miss_rate']:.1f}%)\n")
+                f.write(f"- L1数据缓存加载: {stat['L1-dcache-loads']:,}\n")
+                f.write(f"- L1数据缓存缺失: {stat['L1-dcache-load-misses']:,} ({stat['l1_dcache_miss_rate']:.1f}%)\n")
+                f.write(f"- LLC加载: {stat['LLC-loads']:,}\n")
+                f.write(f"- LLC缺失: {stat['LLC-load-misses']:,} ({stat['llc_miss_rate']:.1f}%)\n\n")
+    
+    print(f"Performance report generated: {report_path}")
+
 def main():
     # 设置目录
     json_base_dir = './results/json'
@@ -291,7 +509,11 @@ def main():
     perf_base_dir = './results/perfs'
     
     # 加载最新的数据和对应的时间戳
-    results, timestamp = load_latest_results(json_base_dir)
+    try:
+        results, timestamp = load_latest_results(json_base_dir)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        return
     
     # 创建当前运行的analysis目录
     analysis_run_dir = os.path.join(analysis_base_dir, timestamp)
@@ -303,40 +525,64 @@ def main():
     sns.set_palette("husl")
     
     # 创建原有图表
-    plot_major_stages_timing(results['timing_stats'], analysis_run_dir)
-    plot_training_substages_timing(results['timing_stats'], analysis_run_dir)
-    plot_epoch_timing(results['epoch_details'], analysis_run_dir)
+    try:
+        plot_major_stages_timing(results['timing_stats'], analysis_run_dir)
+        plot_training_substages_timing(results['timing_stats'], analysis_run_dir)
+        plot_epoch_timing(results['epoch_details'], analysis_run_dir)
+    except Exception as e:
+        print(f"Error creating timing plots: {e}")
     
     # 加载并分析性能统计
-    perf_dir = os.path.join(perf_base_dir, timestamp)
-    if os.path.exists(perf_dir):
+    try:
+        perf_dir = find_latest_perf_dir(perf_base_dir)
         print(f"Loading performance statistics from {perf_dir}")
         epoch_stats, stage_stats = load_perf_stats(perf_dir)
         
+        # 生成性能报告 (包含内存带宽)
+        generate_performance_report(results['timing_stats'], epoch_stats, stage_stats, analysis_run_dir)
+        
         if epoch_stats:
             print("Generating cache metrics plots for epochs...")
-            plot_cache_metrics_epochs(epoch_stats, analysis_run_dir)
-            plot_cache_miss_rates_epochs(epoch_stats, analysis_run_dir)
+            try:
+                plot_cache_metrics_epochs(epoch_stats, analysis_run_dir)
+                plot_cache_miss_rates_epochs(epoch_stats, analysis_run_dir)
+            except Exception as e:
+                print(f"Error creating epoch cache plots: {e}")
         else:
             print("No epoch performance statistics found")
             
         if stage_stats:
             print("Generating cache metrics plots for stages...")
-            plot_cache_metrics_stages(stage_stats, analysis_run_dir)
-            plot_cache_miss_rates_stages(stage_stats, analysis_run_dir)
+            try:
+                plot_cache_metrics_stages(stage_stats, analysis_run_dir)
+                plot_cache_miss_rates_stages(stage_stats, analysis_run_dir)
+            except Exception as e:
+                print(f"Error creating stage cache plots: {e}")
         else:
             print("No stage performance statistics found")
-    else:
-        print(f"Performance statistics directory not found: {perf_dir}")
+            
+        # 绘制IPC和分支预测错误率图表
+        if stage_stats:
+            print("Generating IPC and Branch Miss Rate plot for stages...")
+            try:
+                plot_ipc_branch_miss_rate_stages(stage_stats, analysis_run_dir)
+            except Exception as e:
+                print(f"Error creating IPC and Branch Miss Rate plot: {e}")
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+    except Exception as e:
+        print(f"Error processing performance statistics: {e}")
     
-    print("\nAnalysis complete! Generated charts in analysis directory:")
-    print(f"1. {os.path.join(analysis_run_dir, 'major_stages_timing.png')} - Major stages time distribution")
-    print(f"2. {os.path.join(analysis_run_dir, 'training_validation_pie_chart.png')} - Training and Validation Time within Average Epoch")
-    print(f"3. {os.path.join(analysis_run_dir, 'epoch_timing.png')} - Training, Validation, and Total Time per Epoch")
-    print(f"4. {os.path.join(analysis_run_dir, 'cache_metrics_epochs.png')} - Cache metrics across epochs")
-    print(f"5. {os.path.join(analysis_run_dir, 'cache_miss_rates_epochs.png')} - Cache miss rates across epochs")
-    print(f"6. {os.path.join(analysis_run_dir, 'cache_metrics_stages.png')} - Cache metrics across stages")
-    print(f"7. {os.path.join(analysis_run_dir, 'cache_miss_rates_stages.png')} - Cache miss rates across stages")
+    print("\nAnalysis complete! Generated charts and reports in analysis directory:")
+    print(f"1. {os.path.join(analysis_run_dir, 'performance_report.txt')} - Detailed performance metrics (including estimated memory bandwidth)")
+    print(f"2. {os.path.join(analysis_run_dir, 'major_stages_timing.png')} - Major stages time distribution")
+    print(f"3. {os.path.join(analysis_run_dir, 'training_validation_pie_chart.png')} - Training and Validation Time within Average Epoch")
+    print(f"4. {os.path.join(analysis_run_dir, 'epoch_timing.png')} - Training, Validation, and Total Time per Epoch")
+    print(f"5. {os.path.join(analysis_run_dir, 'cache_metrics_epochs.png')} - Cache metrics across epochs")
+    print(f"6. {os.path.join(analysis_run_dir, 'cache_miss_rates_epochs.png')} - Cache miss rates across epochs")
+    print(f"7. {os.path.join(analysis_run_dir, 'cache_metrics_stages_subplots.png')} - Cache metrics across stages")
+    print(f"8. {os.path.join(analysis_run_dir, 'cache_miss_rates_stages.png')} - Cache miss rates across stages")
+    print(f"9. {os.path.join(analysis_run_dir, 'ipc_branch_miss_rate_stages.png')} - IPC and Branch Miss Rate across stages")
 
 if __name__ == "__main__":
     main() 
