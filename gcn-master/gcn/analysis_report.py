@@ -4,6 +4,7 @@ import glob
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import re
 
 def load_latest_results(json_base_dir='./results/json'):
     """加载最新的结果文件"""
@@ -120,10 +121,174 @@ def plot_epoch_timing(epoch_details, analysis_run_dir):
     plt.savefig(os.path.join(analysis_run_dir, 'epoch_timing.png'))
     plt.close()
 
+def parse_perf_stats(file_path):
+    """解析perf stat输出文件"""
+    stats = {}
+    try:
+        with open(file_path, 'r') as f:
+            content = f.read()
+            
+        # 定义要提取的指标
+        metrics = [
+            'cache-references',
+            'cache-misses',
+            'L1-dcache-load-misses',
+            'L1-dcache-loads',
+            'L1-dcache-stores',
+            'L1-icache-load-misses',
+            'LLC-loads',
+            'LLC-load-misses'
+        ]
+        
+        # 提取每个指标的值
+        for metric in metrics:
+            pattern = rf'(\d+(?:,\d+)*)\s+{metric}'
+            match = re.search(pattern, content)
+            if match:
+                # 移除逗号并转换为整数
+                value = int(match.group(1).replace(',', ''))
+                stats[metric] = value
+            else:
+                stats[metric] = 0
+                
+        # 计算缺失率
+        if stats['cache-references'] > 0:
+            stats['cache_miss_rate'] = stats['cache-misses'] / stats['cache-references'] * 100
+        if stats['L1-dcache-loads'] > 0:
+            stats['l1_dcache_miss_rate'] = stats['L1-dcache-load-misses'] / stats['L1-dcache-loads'] * 100
+        if stats['LLC-loads'] > 0:
+            stats['llc_miss_rate'] = stats['LLC-load-misses'] / stats['LLC-loads'] * 100
+            
+        return stats
+    except Exception as e:
+        print(f"Error parsing perf stats file {file_path}: {e}")
+        return None
+
+def load_perf_stats(perf_dir):
+    """加载所有perf统计文件"""
+    epoch_stats = []
+    stage_stats = {}
+    
+    # 读取epoch统计
+    for i in range(10):  # 前10个epoch
+        file_path = os.path.join(perf_dir, f'epoch_{i}_memory_stats.txt')
+        if os.path.exists(file_path):
+            stats = parse_perf_stats(file_path)
+            if stats:
+                stats['epoch'] = i
+                epoch_stats.append(stats)
+    
+    # 读取阶段统计
+    stages = ['model_building', 'preprocessing', 'training', 'validation', 'testing']
+    for stage in stages:
+        file_path = os.path.join(perf_dir, f'{stage}_memory_stats.txt')
+        if os.path.exists(file_path):
+            stats = parse_perf_stats(file_path)
+            if stats:
+                stage_stats[stage] = stats
+    
+    return epoch_stats, stage_stats
+
+def plot_cache_metrics_epochs(epoch_stats, analysis_run_dir):
+    """绘制epoch缓存指标折线图"""
+    epochs = [stat['epoch'] for stat in epoch_stats]
+    metrics = ['cache-references', 'cache-misses', 'L1-dcache-load-misses', 
+              'L1-dcache-loads', 'L1-dcache-stores', 'L1-icache-load-misses',
+              'LLC-loads', 'LLC-load-misses']
+    
+    plt.figure(figsize=(15, 8))
+    for metric in metrics:
+        values = [stat[metric] for stat in epoch_stats]
+        plt.plot(epochs, values, marker='o', label=metric)
+    
+    plt.title('Cache Metrics Across Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Count')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(analysis_run_dir, 'cache_metrics_epochs.png'))
+    plt.close()
+
+def plot_cache_miss_rates_epochs(epoch_stats, analysis_run_dir):
+    """绘制epoch缓存缺失率柱状图"""
+    epochs = [stat['epoch'] for stat in epoch_stats]
+    miss_rates = {
+        'Cache Miss Rate': [stat['cache_miss_rate'] for stat in epoch_stats],
+        'L1 DCache Miss Rate': [stat['l1_dcache_miss_rate'] for stat in epoch_stats],
+        'LLC Miss Rate': [stat['llc_miss_rate'] for stat in epoch_stats]
+    }
+    
+    x = np.arange(len(epochs))
+    width = 0.25
+    
+    plt.figure(figsize=(12, 6))
+    for i, (name, rates) in enumerate(miss_rates.items()):
+        plt.bar(x + i*width, rates, width, label=name)
+    
+    plt.title('Cache Miss Rates Across Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('Miss Rate (%)')
+    plt.xticks(x + width, epochs)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(analysis_run_dir, 'cache_miss_rates_epochs.png'))
+    plt.close()
+
+def plot_cache_metrics_stages(stage_stats, analysis_run_dir):
+    """绘制各阶段缓存指标折线图"""
+    stages = list(stage_stats.keys())
+    metrics = ['cache-references', 'cache-misses', 'L1-dcache-load-misses', 
+              'L1-dcache-loads', 'L1-dcache-stores', 'L1-icache-load-misses',
+              'LLC-loads', 'LLC-load-misses']
+    
+    plt.figure(figsize=(15, 8))
+    for metric in metrics:
+        values = [stage_stats[stage][metric] for stage in stages]
+        plt.plot(stages, values, marker='o', label=metric)
+    
+    plt.title('Cache Metrics Across Stages')
+    plt.xlabel('Stage')
+    plt.ylabel('Count')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig(os.path.join(analysis_run_dir, 'cache_metrics_stages.png'))
+    plt.close()
+
+def plot_cache_miss_rates_stages(stage_stats, analysis_run_dir):
+    """绘制各阶段缓存缺失率柱状图"""
+    stages = list(stage_stats.keys())
+    miss_rates = {
+        'Cache Miss Rate': [stage_stats[stage]['cache_miss_rate'] for stage in stages],
+        'L1 DCache Miss Rate': [stage_stats[stage]['l1_dcache_miss_rate'] for stage in stages],
+        'LLC Miss Rate': [stage_stats[stage]['llc_miss_rate'] for stage in stages]
+    }
+    
+    x = np.arange(len(stages))
+    width = 0.25
+    
+    plt.figure(figsize=(12, 6))
+    for i, (name, rates) in enumerate(miss_rates.items()):
+        plt.bar(x + i*width, rates, width, label=name)
+    
+    plt.title('Cache Miss Rates Across Stages')
+    plt.xlabel('Stage')
+    plt.ylabel('Miss Rate (%)')
+    plt.xticks(x + width, stages, rotation=45)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(analysis_run_dir, 'cache_miss_rates_stages.png'))
+    plt.close()
+
 def main():
     # 设置目录
     json_base_dir = './results/json'
     analysis_base_dir = './results/analysis'
+    perf_base_dir = './results/perfs'
     
     # 加载最新的数据和对应的时间戳
     results, timestamp = load_latest_results(json_base_dir)
@@ -137,15 +302,41 @@ def main():
     plt.style.use('seaborn')
     sns.set_palette("husl")
     
-    # 创建图表
+    # 创建原有图表
     plot_major_stages_timing(results['timing_stats'], analysis_run_dir)
     plot_training_substages_timing(results['timing_stats'], analysis_run_dir)
     plot_epoch_timing(results['epoch_details'], analysis_run_dir)
     
-    print("Analysis complete! Generated charts in analysis directory:")
+    # 加载并分析性能统计
+    perf_dir = os.path.join(perf_base_dir, timestamp)
+    if os.path.exists(perf_dir):
+        print(f"Loading performance statistics from {perf_dir}")
+        epoch_stats, stage_stats = load_perf_stats(perf_dir)
+        
+        if epoch_stats:
+            print("Generating cache metrics plots for epochs...")
+            plot_cache_metrics_epochs(epoch_stats, analysis_run_dir)
+            plot_cache_miss_rates_epochs(epoch_stats, analysis_run_dir)
+        else:
+            print("No epoch performance statistics found")
+            
+        if stage_stats:
+            print("Generating cache metrics plots for stages...")
+            plot_cache_metrics_stages(stage_stats, analysis_run_dir)
+            plot_cache_miss_rates_stages(stage_stats, analysis_run_dir)
+        else:
+            print("No stage performance statistics found")
+    else:
+        print(f"Performance statistics directory not found: {perf_dir}")
+    
+    print("\nAnalysis complete! Generated charts in analysis directory:")
     print(f"1. {os.path.join(analysis_run_dir, 'major_stages_timing.png')} - Major stages time distribution")
     print(f"2. {os.path.join(analysis_run_dir, 'training_validation_pie_chart.png')} - Training and Validation Time within Average Epoch")
     print(f"3. {os.path.join(analysis_run_dir, 'epoch_timing.png')} - Training, Validation, and Total Time per Epoch")
+    print(f"4. {os.path.join(analysis_run_dir, 'cache_metrics_epochs.png')} - Cache metrics across epochs")
+    print(f"5. {os.path.join(analysis_run_dir, 'cache_miss_rates_epochs.png')} - Cache miss rates across epochs")
+    print(f"6. {os.path.join(analysis_run_dir, 'cache_metrics_stages.png')} - Cache metrics across stages")
+    print(f"7. {os.path.join(analysis_run_dir, 'cache_miss_rates_stages.png')} - Cache miss rates across stages")
 
 if __name__ == "__main__":
     main() 

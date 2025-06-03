@@ -4,178 +4,223 @@ import subprocess
 import json
 import time
 from datetime import datetime
+import re
+import signal
 
-def run_perf_record(command, output_file, events=None):
-    """使用perf record记录性能数据"""
-    if events is None:
-        events = [
-            'cpu-clock',           # CPU时钟周期
-            'cycles',             # CPU周期数
-            'instructions',       # 指令数
-            'cache-references',   # 缓存引用
-            'cache-misses',       # 缓存未命中
-            'branch-instructions', # 分支指令
-            'branch-misses',      # 分支预测失败
-            'L1-dcache-loads',    # L1数据缓存加载
-            'L1-dcache-load-misses', # L1数据缓存加载未命中
-            'L1-icache-load-misses', # L1指令缓存加载未命中
-            'LLC-loads',          # 最后一级缓存加载
-            'LLC-load-misses',    # 最后一级缓存加载未命中
-            'dTLB-loads',         # 数据TLB加载
-            'dTLB-load-misses',   # 数据TLB加载未命中
-            'iTLB-loads',         # 指令TLB加载
-            'iTLB-load-misses'    # 指令TLB加载未命中
-        ]
-    
-    perf_cmd = ['perf', 'record', '-g', '-e', ','.join(events), '-o', output_file] + command
+def get_memory_events():
+    """返回性能事件列表"""
+    return [
+        # 基本性能事件
+        'branch-misses',
+        'cache-misses',
+        'cache-references',
+        'cpu-cycles',
+        'instructions',
+        'alignment-faults',
+        'context-switches',
+        'cpu-clock',
+        'cpu-migrations',
+        'dummy',
+        'emulation-faults',
+        'major-faults',
+        'minor-faults',
+        'page-faults',
+        'task-clock',
+        
+        # 缓存相关事件
+        'L1-dcache-load-misses',
+        'L1-dcache-loads',
+        'L1-dcache-stores',
+        'L1-icache-load-misses',
+        'LLC-loads',          # 最后一级缓存加载
+        'LLC-load-misses',    # 最后一级缓存加载未命中
+        
+        # 分支预测相关事件
+        'branch-load-misses',
+        'branch-loads',
+        
+        # TLB相关事件
+        'dTLB-load-misses',
+        'dTLB-loads',
+        'iTLB-loads',
+        'iTLB-load-misses'
+    ]
+
+def calculate_hit_rates(stats_file):
+    """计算缓存命中率"""
     try:
-        subprocess.run(perf_cmd, check=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"Error running perf record: {e}")
-        return False
+        with open(stats_file, 'r') as f:
+            content = f.read()
+            
+        # 解析缓存引用和未命中
+        cache_refs = re.search(r'(\d+)\s+cache-references', content)
+        cache_misses = re.search(r'(\d+)\s+cache-misses', content)
+        
+        # 解析L1数据缓存
+        l1_loads = re.search(r'(\d+)\s+L1-dcache-loads', content)
+        l1_misses = re.search(r'(\d+)\s+L1-dcache-load-misses', content)
+        
+        # 解析LLC缓存
+        llc_loads = re.search(r'(\d+)\s+LLC-loads', content)
+        llc_misses = re.search(r'(\d+)\s+LLC-load-misses', content)
+        
+        # 解析TLB
+        dtlb_loads = re.search(r'(\d+)\s+dTLB-loads', content)
+        dtlb_misses = re.search(r'(\d+)\s+dTLB-load-misses', content)
+        
+        hit_rates = {}
+        
+        # 计算各级缓存命中率
+        if cache_refs and cache_misses:
+            refs = int(cache_refs.group(1))
+            misses = int(cache_misses.group(1))
+            hit_rates['cache_hit_rate'] = (refs - misses) / refs * 100 if refs > 0 else 0
+            
+        if l1_loads and l1_misses:
+            loads = int(l1_loads.group(1))
+            misses = int(l1_misses.group(1))
+            hit_rates['l1_dcache_hit_rate'] = (loads - misses) / loads * 100 if loads > 0 else 0
+            
+        if llc_loads and llc_misses:
+            loads = int(llc_loads.group(1))
+            misses = int(llc_misses.group(1))
+            hit_rates['llc_hit_rate'] = (loads - misses) / loads * 100 if loads > 0 else 0
+            
+        if dtlb_loads and dtlb_misses:
+            loads = int(dtlb_loads.group(1))
+            misses = int(dtlb_misses.group(1))
+            hit_rates['dtlb_hit_rate'] = (loads - misses) / loads * 100 if loads > 0 else 0
+            
+        return hit_rates
+    except Exception as e:
+        print(f"Error calculating hit rates: {e}")
+        return {}
 
-def run_perf_report(perf_data_file, output_file):
-    """生成perf报告"""
-    perf_cmd = ['perf', 'report', '-i', perf_data_file, '--stdio', '--sort', 'comm,dso,symbol']
+def collect_stage_memory_stats(pid, stage_name, output_file):
+    """收集特定阶段的访存统计信息"""
+    events = get_memory_events()
+    perf_cmd = [
+        'perf', 'stat',
+        '-e', ','.join(events),
+        '-p', str(pid),
+        '--', 'sleep', '1'
+    ]
+    
     try:
         with open(output_file, 'w') as f:
-            subprocess.run(perf_cmd, stdout=f, check=True)
+            subprocess.run(perf_cmd, stdout=f, stderr=f, check=True)
         return True
     except subprocess.CalledProcessError as e:
-        print(f"Error running perf report: {e}")
+        print(f"Error collecting memory stats for {stage_name}: {e}")
         return False
 
-def run_perf_stat(command, output_file, events=None):
-    """使用perf stat收集统计信息"""
-    if events is None:
-        events = [
-            'cpu-clock',
-            'cycles',
-            'instructions',
-            'cache-references',
-            'cache-misses',
-            'branch-instructions',
-            'branch-misses',
-            'L1-dcache-loads',
-            'L1-dcache-load-misses',
-            'L1-icache-load-misses',
-            'LLC-loads',
-            'LLC-load-misses',
-            'dTLB-loads',
-            'dTLB-load-misses',
-            'iTLB-loads',
-            'iTLB-load-misses'
-        ]
+def collect_epoch_memory_stats(pid, epoch_num, output_file):
+    """收集特定epoch的访存统计信息"""
+    if not is_process_running(pid):
+        print(f"Process {pid} is not running when trying to collect stats for epoch {epoch_num}")
+        return False
+        
+    events = get_memory_events()
+    perf_cmd = [
+        'perf', 'stat',
+        '-e', ','.join(events),
+        '-p', str(pid),
+        '--', 'sleep', '1'
+    ]
     
-    perf_cmd = ['perf', 'stat', '-e', ','.join(events), '-o', output_file] + command
-    try:
-        subprocess.run(perf_cmd, check=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"Error running perf stat: {e}")
-        return False
-
-def analyze_perf_data(perf_data_file, output_file):
-    """分析perf数据并生成详细报告"""
-    # 使用perf script生成详细的事件跟踪，并按阶段分类
-    perf_cmd = ['perf', 'script', '-i', perf_data_file, '--time', '--cpu', '--event', '--sym']
+    print(f"Running perf stat for epoch {epoch_num}")
+    
     try:
         with open(output_file, 'w') as f:
-            subprocess.run(perf_cmd, stdout=f, check=True)
+            result = subprocess.run(perf_cmd, stdout=f, stderr=f, check=True)
+            print(f"Successfully collected stats for epoch {epoch_num}")
+            
+            # 计算并添加命中率信息
+            hit_rates = calculate_hit_rates(output_file)
+            if hit_rates:
+                with open(output_file, 'a') as f:
+                    f.write("\nHit Rates:\n")
+                    for name, rate in hit_rates.items():
+                        f.write(f"{name}: {rate:.2f}%\n")
+            
         return True
     except subprocess.CalledProcessError as e:
-        print(f"Error analyzing perf data: {e}")
+        print(f"Error collecting memory stats for epoch {epoch_num}: {e}")
         return False
 
-def generate_stage_analysis(perf_data_file, output_dir):
-    """生成各个训练阶段的性能分析报告"""
-    stages = {
-        'data_loading': 'Loading data',
-        'preprocessing': 'Preprocessing',
-        'model_building': 'Building model',
-        'training': 'Training',
-        'validation': 'Validation',
-        'testing': 'Testing'
-    }
-    
-    for stage_name, stage_desc in stages.items():
-        # 为每个阶段生成性能报告
-        stage_file = os.path.join(output_dir, f'{stage_name}_analysis.txt')
-        perf_cmd = [
-            'perf', 'report', '-i', perf_data_file,
-            '--stdio',
-            '--sort', 'comm,dso,symbol',
-            '--symbol-filter', stage_desc
-        ]
-        try:
-            with open(stage_file, 'w') as f:
-                subprocess.run(perf_cmd, stdout=f, check=True)
-            print(f"Generated analysis for {stage_name}")
-        except subprocess.CalledProcessError as e:
-            print(f"Error generating analysis for {stage_name}: {e}")
+def is_process_running(pid):
+    """检查进程是否在运行"""
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 def main():
     # 创建输出目录
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     perf_dir = os.path.join('results', 'perfs', timestamp)
     os.makedirs(perf_dir, exist_ok=True)
-
-    # 定义要监控的性能事件
-    events = [
-        'cpu-clock',           # CPU时钟周期
-        'cycles',             # CPU周期数
-        'instructions',       # 指令数
-        'cache-references',   # 缓存引用
-        'cache-misses',       # 缓存未命中
-        'branch-instructions', # 分支指令
-        'branch-misses',      # 分支预测失败
-        'L1-dcache-loads',    # L1数据缓存加载
-        'L1-dcache-load-misses', # L1数据缓存加载未命中
-        'L1-icache-load-misses', # L1指令缓存加载未命中
-        'LLC-loads',          # 最后一级缓存加载
-        'LLC-load-misses',    # 最后一级缓存加载未命中
-        'dTLB-loads',         # 数据TLB加载
-        'dTLB-load-misses',   # 数据TLB加载未命中
-        'iTLB-loads',         # 指令TLB加载
-        'iTLB-load-misses'    # 指令TLB加载未命中
-    ]
-
-    # 设置要分析的命令
-    command = ['python', 'train.py']
-
-    # 运行perf record和stat的组合命令
-    print("Running perf record and stat...")
-    perf_data_file = os.path.join(perf_dir, 'perf.data')
-    stat_file = os.path.join(perf_dir, 'perf_stat.txt')
     
-    # 组合perf record和stat命令
-    perf_cmd = ['perf', 'record', '-g', '-e', ','.join(events), '-o', perf_data_file, '--', 'perf', 'stat', '-e', ','.join(events), '-o', stat_file] + command
+    print(f"Created output directory: {perf_dir}")
+    
+    # 启动训练进程
+    train_process = subprocess.Popen(['python', 'train.py'])
+    pid = train_process.pid
+    print(f"Training process started with PID: {pid}")
     
     try:
-        subprocess.run(perf_cmd, check=True)
-        print(f"Perf data saved to {perf_data_file}")
-        print(f"Perf statistics saved to {stat_file}")
-
-        # 生成perf报告
-        print("Generating perf report...")
-        report_file = os.path.join(perf_dir, 'perf_report.txt')
-        if run_perf_report(perf_data_file, report_file):
-            print(f"Perf report saved to {report_file}")
-
-        # 生成详细的事件跟踪
-        print("Generating detailed event trace...")
-        trace_file = os.path.join(perf_dir, 'perf_trace.txt')
-        if analyze_perf_data(perf_data_file, trace_file):
-            print(f"Detailed event trace saved to {trace_file}")
+        # 等待训练进程启动
+        time.sleep(5)
+        
+        if not is_process_running(pid):
+            print("Training process failed to start")
+            return
             
-        # 生成各个阶段的性能分析
-        print("Generating stage-wise performance analysis...")
-        generate_stage_analysis(perf_data_file, perf_dir)
+        # 收集各个阶段的访存统计信息
+        stages = ['model_building', 'preprocessing', 'training', 'validation', 'testing']
+        for stage in stages:
+            if not is_process_running(pid):
+                print(f"Training process ended before collecting {stage} stats")
+                break
+            stats_file = os.path.join(perf_dir, f'{stage}_memory_stats.txt')
+            if collect_stage_memory_stats(pid, stage, stats_file):
+                print(f"Successfully collected stats for {stage}")
+                # 计算并添加命中率信息
+                hit_rates = calculate_hit_rates(stats_file)
+                if hit_rates:
+                    with open(stats_file, 'a') as f:
+                        f.write("\nHit Rates:\n")
+                        for name, rate in hit_rates.items():
+                            f.write(f"{name}: {rate:.2f}%\n")
             
-    except subprocess.CalledProcessError as e:
-        print(f"Error running perf: {e}")
-        return
+        # 只收集前10个epoch的访存统计信息
+        for epoch in range(10):
+            if not is_process_running(pid):
+                print(f"Training process ended at epoch {epoch}")
+                break
+                
+            print(f"\nCollecting stats for epoch {epoch}")
+            
+            # 使用perf stat收集当前epoch的统计信息
+            stats_file = os.path.join(perf_dir, f'epoch_{epoch}_memory_stats.txt')
+            if collect_epoch_memory_stats(pid, epoch, stats_file):
+                print(f"Successfully collected stats for epoch {epoch}")
+            else:
+                # 如果收集失败，检查进程是否还在运行
+                if not is_process_running(pid):
+                    print(f"Training process ended at epoch {epoch}")
+                    break
+            
+        print("Memory stats collection completed successfully!")
+        
+    except Exception as e:
+        print(f"Error during memory stats collection: {e}")
+    finally:
+        # 确保训练进程被正确终止
+        if is_process_running(pid):
+            train_process.terminate()
+            train_process.wait()
 
 if __name__ == "__main__":
     main()
