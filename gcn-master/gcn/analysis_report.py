@@ -865,9 +865,9 @@ def plot_memory_bandwidth_comparison(perf_dir, analysis_run_dir):
 
 def main():
     # 设置目录
-    json_base_dir = './results/json'
-    analysis_base_dir = './results/analysis'
-    perf_base_dir = './results/perfs'
+    json_base_dir = './results/citeseer/json'
+    analysis_base_dir = './results/citeseer/analysis'
+    perf_base_dir = './results/citeseer/perfs'
     
     # 加载最新的数据和对应的时间戳
     try:

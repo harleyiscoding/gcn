@@ -161,9 +161,16 @@ def is_process_running(pid):
         return False
 
 def main():
+    # 从train.py中获取数据集名称
+    try:
+        import train
+        dataset = train.FLAGS.dataset
+    except:
+        dataset = 'cora'  # 默认值
+    
     # 创建输出目录
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    perf_dir = os.path.join('results', 'perfs', timestamp)
+    perf_dir = os.path.join('results', dataset, 'perfs', timestamp)
     os.makedirs(perf_dir, exist_ok=True)
     
     print(f"Created output directory: {perf_dir}")
