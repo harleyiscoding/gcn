@@ -162,7 +162,8 @@ class GraphConvolution(Layer):
 
     def _update(self, inputs):
         """更新操作：特征变换、偏置和激活函数"""
-        with tf.name_scope(f'layer{self.name[-1]}_update'):
+        layer_idx = self.name.split('_')[-1]  # e.g. graphconvolution_1 -> 1
+        with tf.name_scope(f'layer{layer_idx}_update'):
             x = inputs
             # dropout
             if self.sparse_inputs:
@@ -176,7 +177,6 @@ class GraphConvolution(Layer):
                               sparse=self.sparse_inputs)
             else:
                 pre_sup = self.vars['weights_0']
-            
             # 偏置和激活函数
             if self.bias:
                 pre_sup += self.vars['bias']
@@ -184,7 +184,8 @@ class GraphConvolution(Layer):
 
     def _aggregate(self, inputs):
         """聚合操作：邻居信息聚合"""
-        with tf.name_scope(f'layer{self.name[-1]}_aggregate'):
+        layer_idx = self.name.split('_')[-1]
+        with tf.name_scope(f'layer{layer_idx}_aggregate'):
             supports = list()
             for i in range(len(self.support)):
                 support = dot(self.support[i], inputs, sparse=True)
