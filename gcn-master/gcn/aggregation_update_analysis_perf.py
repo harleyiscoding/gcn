@@ -6,7 +6,7 @@ import re
 from collections import defaultdict
 
 def parse_perf_file(file_path):
-    """解析perf统计文件，提取L1缓存数据"""
+    """解析perf统计文件，提取L1缓存和LLC数据"""
     if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
         return None
         
@@ -21,6 +21,10 @@ def parse_perf_file(file_path):
         # 解析L1缓存数据 - 更新正则表达式以匹配实际格式
         l1_misses = re.search(r'(\d+(?:,\d+)*)\s+L1-dcache-load-misses', content)
         l1_loads = re.search(r'(\d+(?:,\d+)*)\s+L1-dcache-loads', content)
+        # 新增LLC-misses解析
+        llc_misses = re.search(r'(\d+(?:,\d+)*)\s+LLC-load-misses', content)
+        if not llc_misses:
+            llc_misses = re.search(r'(\d+(?:,\d+)*)\s+LLC-misses', content)
         
         # 打印匹配结果用于调试
         print(f"\nDebug: L1 cache matches in {file_path}:")
@@ -44,6 +48,11 @@ def parse_perf_file(file_path):
                 metrics['l1_misses'] = misses
                 metrics['l1_loads'] = loads
                 print(f"Debug: L1 Misses={misses:,}, L1 Loads={loads:,}, L1 Cache Miss Rate={metrics['cache_miss_rate']:.4f}")
+            # 处理LLC-misses和DRAM访问字节
+            if llc_misses:
+                llc_miss_count = int(llc_misses.group(1).replace(',', ''))
+                metrics['llc_misses'] = llc_miss_count
+                metrics['dram_bytes'] = llc_miss_count * 64  # 64字节cacheline
         
     return metrics
 
@@ -96,6 +105,9 @@ def calculate_metrics(data_dir):
                     # L1缓存数据
                     actual_agg_misses = agg_metrics['l1_misses'] - prev_update_metrics['l1_misses']
                     actual_agg_loads = agg_metrics['l1_loads'] - prev_update_metrics['l1_loads']
+                    # 新增LLC/DRAM
+                    actual_agg_llc_misses = agg_metrics.get('llc_misses', 0) - prev_update_metrics.get('llc_misses', 0)
+                    actual_agg_dram_bytes = agg_metrics.get('dram_bytes', 0) - prev_update_metrics.get('dram_bytes', 0)
                     
                     # 确保差值非负且合理
                     if actual_agg_misses >= 0 and actual_agg_loads >= 0 and actual_agg_misses <= actual_agg_loads:
@@ -104,6 +116,9 @@ def calculate_metrics(data_dir):
                         metrics[f'{layer}_aggregation']['cache_miss_rate'].append(
                             actual_agg_misses / actual_agg_loads if actual_agg_loads > 0 else 0
                         )
+                        # 新增DRAM
+                        metrics[f'{layer}_aggregation']['llc_misses'].append(actual_agg_llc_misses)
+                        metrics[f'{layer}_aggregation']['dram_bytes'].append(actual_agg_dram_bytes)
                         valid_epochs += 1
                     else:
                         print(f"Warning: Invalid difference in {layer} aggregation at epoch {i+11}")
@@ -122,6 +137,8 @@ def calculate_metrics(data_dir):
                     # L1缓存数据
                     actual_update_misses = update_metrics['l1_misses'] - prev_agg_metrics['l1_misses']
                     actual_update_loads = update_metrics['l1_loads'] - prev_agg_metrics['l1_loads']
+                    actual_update_llc_misses = update_metrics.get('llc_misses', 0) - prev_agg_metrics.get('llc_misses', 0)
+                    actual_update_dram_bytes = update_metrics.get('dram_bytes', 0) - prev_agg_metrics.get('dram_bytes', 0)
                     
                     # 确保差值非负且合理
                     if actual_update_misses >= 0 and actual_update_loads >= 0 and actual_update_misses <= actual_update_loads:
@@ -130,6 +147,9 @@ def calculate_metrics(data_dir):
                         metrics[f'{layer}_update']['cache_miss_rate'].append(
                             actual_update_misses / actual_update_loads if actual_update_loads > 0 else 0
                         )
+                        # 新增DRAM
+                        metrics[f'{layer}_update']['llc_misses'].append(actual_update_llc_misses)
+                        metrics[f'{layer}_update']['dram_bytes'].append(actual_update_dram_bytes)
                     else:
                         print(f"Warning: Invalid difference in {layer} update at epoch {i+11}")
                         print(f"  Current misses: {update_metrics['l1_misses']}, Previous agg misses: {prev_agg_metrics['l1_misses']}")
@@ -241,10 +261,10 @@ def plot_metrics(metrics, output_dir):
     plt.title('L1 Cache Miss Rate: Update vs Aggregation', fontsize=12)
     plt.xticks(x, categories)
     plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.3)
-        plt.tight_layout()
+    plt.grid(True, linestyle='--', alpha=0.3)
+    plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'l1_cache_miss_rate_bar_comparison.png'), dpi=300, bbox_inches='tight')
-        plt.close()
+    plt.close()
         
     # 4.2 L1缓存访问次数柱状图对比
     plt.figure(figsize=(8, 6))
@@ -266,14 +286,14 @@ def plot_metrics(metrics, output_dir):
     plt.title('L1 Cache Loads: Update vs Aggregation', fontsize=12)
     plt.xticks(x, categories)
     plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.3)
-        plt.yscale('log')
-        plt.tight_layout()
+    plt.grid(True, linestyle='--', alpha=0.3)
+    plt.yscale('log')
+    plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'l1_cache_loads_bar_comparison.png'), dpi=300, bbox_inches='tight')
-        plt.close()
+    plt.close()
     
     # 4.3 L1缓存缺失次数柱状图对比
-        plt.figure(figsize=(8, 6))
+    plt.figure(figsize=(8, 6))
     avg_metrics = {
         'layer1_update': np.mean(metrics['layer1_update']['l1_misses'][:min_length]),
         'layer1_aggregation': np.mean(metrics['layer1_aggregation']['l1_misses'][:min_length]),
@@ -282,21 +302,59 @@ def plot_metrics(metrics, output_dir):
     }
     update_data = [avg_metrics['layer1_update'], avg_metrics['layer2_update']]
     aggregation_data = [avg_metrics['layer1_aggregation'], avg_metrics['layer2_aggregation']]
-        x = np.arange(len(categories))
-        width = 0.35
+    x = np.arange(len(categories))
+    width = 0.35
     plt.bar(x - width/2, update_data, width, label='Update', color='#1f77b4')
     plt.bar(x + width/2, aggregation_data, width, label='Aggregation', color='#ff7f0e')
     # 不显示数值标签
     plt.xlabel('Layer', fontsize=10)
     plt.ylabel('Average L1 Cache Misses per Epoch', fontsize=10)
     plt.title('L1 Cache Misses: Update vs Aggregation', fontsize=12)
-        plt.xticks(x, categories)
-        plt.legend()
-        plt.grid(True, linestyle='--', alpha=0.3)
-        plt.yscale('log')
-        plt.tight_layout()
+    plt.xticks(x, categories)
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.3)
+    plt.yscale('log')
+    plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'l1_cache_misses_bar_comparison.png'), dpi=300, bbox_inches='tight')
-        plt.close()
+    plt.close()
+    
+    # 新增DRAM访问字节数折线图
+    plt.figure(figsize=(10, 6))
+    for i, phase in enumerate(['layer1_update', 'layer1_aggregation', 'layer2_update', 'layer2_aggregation']):
+        plt.plot(epochs, np.array(metrics[phase]['dram_bytes'][:min_length]) / (1024*1024),
+                 color=colors[i], label=labels[i], linewidth=1.5, alpha=0.8)
+    plt.xlabel('Epoch', fontsize=10)
+    plt.ylabel('DRAM Access (MB)', fontsize=10)
+    plt.title('DRAM Access Bytes Comparison (After Epoch 10)', fontsize=12)
+    plt.legend(fontsize=10)
+    plt.grid(True, linestyle='--', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'dram_access_bytes_comparison.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # 新增DRAM访问字节数柱状对比图
+    plt.figure(figsize=(8, 6))
+    avg_metrics = {
+        'layer1_update': np.mean(metrics['layer1_update']['dram_bytes'][:min_length]),
+        'layer1_aggregation': np.mean(metrics['layer1_aggregation']['dram_bytes'][:min_length]),
+        'layer2_update': np.mean(metrics['layer2_update']['dram_bytes'][:min_length]),
+        'layer2_aggregation': np.mean(metrics['layer2_aggregation']['dram_bytes'][:min_length])
+    }
+    update_data = [avg_metrics['layer1_update'], avg_metrics['layer2_update']]
+    aggregation_data = [avg_metrics['layer1_aggregation'], avg_metrics['layer2_aggregation']]
+    x = np.arange(len(categories))
+    width = 0.35
+    plt.bar(x - width/2, np.array(update_data)/(1024*1024), width, label='Update', color='#1f77b4')
+    plt.bar(x + width/2, np.array(aggregation_data)/(1024*1024), width, label='Aggregation', color='#ff7f0e')
+    plt.xlabel('Layer', fontsize=10)
+    plt.ylabel('Average DRAM Access (MB)', fontsize=10)
+    plt.title('DRAM Access: Update vs Aggregation', fontsize=12)
+    plt.xticks(x, categories)
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'dram_access_bar_comparison.png'), dpi=300, bbox_inches='tight')
+    plt.close()
     
     # 生成详细的分析报告
     with open(os.path.join(output_dir, 'performance_analysis_report.txt'), 'w') as f:

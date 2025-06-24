@@ -1,4 +1,4 @@
-from gcn.inits import *
+from inits import *
 import tensorflow as tf
 
 flags = tf.app.flags
@@ -160,29 +160,66 @@ class GraphConvolution(Layer):
         if self.logging:
             self._log_vars()
 
-    def _call(self, inputs):
-        x = inputs
+    def _update(self, inputs):
+        """更新操作：特征变换、偏置和激活函数"""
+        layer_idx = self.name.split('_')[-1]  # e.g. graphconvolution_1 -> 1
+        with tf.name_scope(f'layer{layer_idx}_update'):
+            x = inputs
+            # dropout
+            if self.sparse_inputs:
+                x = sparse_dropout(x, 1-self.dropout, self.num_features_nonzero)
+            else:
+                x = tf.nn.dropout(x, 1-self.dropout)
 
-        # dropout
-        if self.sparse_inputs:
-            x = sparse_dropout(x, 1-self.dropout, self.num_features_nonzero)
-        else:
-            x = tf.nn.dropout(x, 1-self.dropout)
-
-        # convolve
-        supports = list()
-        for i in range(len(self.support)):
+            # 特征变换
             if not self.featureless:
-                pre_sup = dot(x, self.vars['weights_' + str(i)],
+                pre_sup = dot(x, self.vars['weights_0'],
                               sparse=self.sparse_inputs)
             else:
-                pre_sup = self.vars['weights_' + str(i)]
-            support = dot(self.support[i], pre_sup, sparse=True)
-            supports.append(support)
-        output = tf.add_n(supports)
+                pre_sup = self.vars['weights_0']
+            # 偏置和激活函数
+            if self.bias:
+                pre_sup += self.vars['bias']
+            return self.act(pre_sup)
 
-        # bias
-        if self.bias:
-            output += self.vars['bias']
+    def _aggregate(self, inputs):
+        """聚合操作：邻居信息聚合"""
+        layer_idx = self.name.split('_')[-1]
+        with tf.name_scope(f'layer{layer_idx}_aggregate'):
+            supports = list()
+            for i in range(len(self.support)):
+                support = dot(self.support[i], inputs, sparse=True)
+                supports.append(support)
+            return tf.add_n(supports)
 
-        return self.act(output)
+    def _call(self, inputs):
+        """原始调用方法，保持向后兼容"""
+        with tf.name_scope(f'layer{self.name[-1]}_call'):
+            x = inputs
+
+            # dropout
+            if self.sparse_inputs:
+                x = sparse_dropout(x, 1-self.dropout, self.num_features_nonzero)
+            else:
+                x = tf.nn.dropout(x, 1-self.dropout)
+
+            # convolve
+            supports = list()
+            for i in range(len(self.support)):
+                # 特征变换（更新）
+                if not self.featureless:
+                    pre_sup = dot(x, self.vars['weights_' + str(i)],
+                                  sparse=self.sparse_inputs)
+                else:
+                    pre_sup = self.vars['weights_' + str(i)]
+                # 邻居信息聚合
+                support = dot(self.support[i], pre_sup, sparse=True)
+                supports.append(support)
+            output = tf.add_n(supports)
+
+            # bias
+            if self.bias:
+                # 偏置项（更新）
+                output += self.vars['bias']
+            # 激活函数（更新）  
+            return self.act(output)

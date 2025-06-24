@@ -17,7 +17,7 @@ def find_latest_flops_dir(base_dir):
 def main():
     # 假设当前目录结构和perf分析脚本一致
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    dataset = 'citeseer'  # 可根据需要修改
+    dataset = 'pubmed'  # 可根据需要修改
     base_dir = os.path.join(current_dir, 'results', dataset)
     flops_dir = find_latest_flops_dir(base_dir)
     flops_file = os.path.join(flops_dir, 'flops_epoch_200.json')
