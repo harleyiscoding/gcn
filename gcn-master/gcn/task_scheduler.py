@@ -3,6 +3,9 @@ import time
 import logging
 import os
 import re
+import numpy as np
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
@@ -52,6 +55,29 @@ def parse_flops(flops_report_path):
                 flops[m.group(1)] = float(m.group(2))
     return flops if flops else None
 
+# K-means聚类法自动分AMIR阈值
+def get_amir_threshold_kmeans(amir_values):
+    amir_values = np.array(amir_values).reshape(-1, 1)
+    kmeans = KMeans(n_clusters=2, random_state=0).fit(amir_values)
+    centers = sorted(kmeans.cluster_centers_.flatten())
+    threshold = (centers[0] + centers[1]) / 2
+    return threshold, kmeans.labels_, centers
+
+# 可视化AMIR聚类效果
+def plot_amir_kmeans(amir_values, labels, centers, threshold, save_path):
+    amir_values = np.array(amir_values)
+    plt.figure(figsize=(8, 4))
+    plt.scatter(range(len(amir_values)), amir_values, c=labels, cmap='coolwarm', label='AMIR')
+    plt.axhline(threshold, color='green', linestyle='--', label=f'Threshold={threshold:.2f}')
+    plt.scatter([-1, -1], centers, c='black', marker='x', s=100, label='Centers')
+    plt.xlabel('Task Index')
+    plt.ylabel('AMIR')
+    plt.title('K-means Clustering of AMIR and Threshold')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
 # 任务生成器（支持真实AMIR计算）
 def generate_tasks(num_tasks, perf_report_path=None, flops_report_path=None):
     tasks = []
@@ -80,21 +106,34 @@ def generate_tasks(num_tasks, perf_report_path=None, flops_report_path=None):
 
 # 调度器
 class Scheduler:
-    def __init__(self):
-        pass
+    def __init__(self, amir_dir=None):
+        self.history_amir = []
+        self.amir_threshold = 5
+        self.kmeans_labels = []
+        self.kmeans_centers = []
+        self.amir_dir = amir_dir
+
+    def update_threshold(self):
+        if len(self.history_amir) >= 20: 
+            threshold, labels, centers = get_amir_threshold_kmeans(self.history_amir[-20:])
+            self.amir_threshold = threshold
+            self.kmeans_labels = labels
+            self.kmeans_centers = centers
 
     def schedule_task(self, task):
-        if task.AMIR > 5 and task.CD < 2:
+        self.history_amir.append(task.AMIR)
+        self.update_threshold()
+        if task.AMIR > self.amir_threshold and task.CD < 2:
             return 'PIM'
         elif task.CD > 10:
             return 'GPU'
         else:
             return 'PNM'
 
-    def schedule_batch(self, tasks):
-        for task in tasks:
-            task.device = self.schedule_task(task)
-            logging.info(f"Task {task.id} assigned to {task.device} (AMIR={task.AMIR}, CD={task.CD})")
+    def plot_amir_clustering(self, filename='amir_kmeans_dynamic.png'):
+        if len(self.history_amir) >= 20 and self.amir_dir:
+            save_path = os.path.join(self.amir_dir, filename)
+            plot_amir_kmeans(self.history_amir[-20:], self.kmeans_labels, self.kmeans_centers, self.amir_threshold, save_path)
 
 # 设备监控与回退
 class DeviceMonitor:
@@ -155,6 +194,72 @@ class Dispatcher:
             task.status = 'finished'
             logging.info(f"Task {task.id} finished on {task.device}")
 
+# 读取memory_flops_epochs.txt所有epoch的AMIR
+def read_amir_from_file(file_path):
+    amir_list = []
+    with open(file_path, 'r') as f:
+        next(f)  # 跳过表头
+        for line in f:
+            parts = line.strip().split('\t')
+            if len(parts) < 5:
+                continue
+            try:
+                agg_mem = float(parts[1])
+                update_flops = float(parts[3])
+                if update_flops > 0:
+                    amir = agg_mem / update_flops
+                    amir_list.append(amir)
+            except Exception:
+                continue
+    return amir_list
+
+# 全局AMIR聚类可视化
+def plot_amir_kmeans_full(amir_values, save_path):
+    amir_values = np.array(amir_values).reshape(-1, 1)
+    kmeans = KMeans(n_clusters=2, random_state=0).fit(amir_values)
+    labels = kmeans.labels_
+    centers = sorted(kmeans.cluster_centers_.flatten())
+    threshold = (centers[0] + centers[1]) / 2
+    plt.figure(figsize=(12, 5))
+    plt.scatter(range(len(amir_values)), amir_values, c=labels, cmap='coolwarm', label='AMIR')
+    plt.axhline(threshold, color='green', linestyle='--', label=f'Threshold={threshold:.2f}')
+    plt.scatter([-1, -1], centers, c='black', marker='x', s=100, label='Centers')
+    plt.xlabel('Epoch')
+    plt.ylabel('AMIR')
+    plt.title('K-means Clustering of All Epochs AMIR and Threshold')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+    print(f"AMIR聚类可视化已保存: {save_path}")
+
+# 从memory_flops_epochs.txt读取真实AMIR和CD生成Task列表
+def read_tasks_from_memory_flops(file_path):
+    tasks = []
+    with open(file_path, 'r') as f:
+        next(f)  # skip header
+        for i, line in enumerate(f):
+            parts = line.strip().split('\t')
+            if len(parts) < 5:
+                continue
+            try:
+                agg_mem = float(parts[1])
+                update_flops = float(parts[3])
+                if update_flops > 0:
+                    amir = agg_mem / update_flops
+                else:
+                    amir = 0
+                cd = update_flops / agg_mem if agg_mem > 0 else 0
+                tasks.append(Task(task_id=i, AMIR=amir, CD=cd))
+            except Exception:
+                continue
+    return tasks
+
+def ensure_amir_dir(base_dir, dataset):
+    amir_dir = os.path.join(base_dir, 'results', dataset, 'AMIR')
+    os.makedirs(amir_dir, exist_ok=True)
+    return amir_dir
+
 # 主流程
 if __name__ == "__main__":
     # 可指定数据集路径
@@ -163,15 +268,23 @@ if __name__ == "__main__":
     perf_report_path = os.path.join(base_dir, 'results', dataset, 'l1_cache_analysis', 'performance_analysis_report.txt')
     flops_report_path = os.path.join(base_dir, 'results', dataset, 'tf-flops', sorted(os.listdir(os.path.join(base_dir, 'results', dataset, 'tf-flops')))[-1], 'flops_analysis_report.txt') if os.path.exists(os.path.join(base_dir, 'results', dataset, 'tf-flops')) else None
 
-    num_tasks = 20
-    tasks = generate_tasks(num_tasks, perf_report_path, flops_report_path)
-    scheduler = Scheduler()
+    memory_flops_path = os.path.join(base_dir, 'results', dataset, 'l1_cache_analysis', 'memory_flops_epochs.txt')
+    if os.path.exists(memory_flops_path):
+        tasks = read_tasks_from_memory_flops(memory_flops_path)
+        num_tasks = len(tasks)
+    else:
+        num_tasks = 200
+        tasks = generate_tasks(num_tasks, perf_report_path, flops_report_path)
+    amir_dir = ensure_amir_dir(base_dir, dataset)
+    scheduler = Scheduler(amir_dir=amir_dir)
     monitor = DeviceMonitor()
     fallback_manager = FallbackManager(monitor)
     dispatcher = Dispatcher()
 
     # 1. 调度
-    scheduler.schedule_batch(tasks)
+    for task in tasks:
+        task.device = scheduler.schedule_task(task)
+        logging.info(f"Task {task.id} assigned to {task.device} (AMIR={task.AMIR}, CD={task.CD}, threshold={scheduler.amir_threshold:.2f})")
 
     # 2. 设备状态监控与回退
     monitor.update_status()
@@ -184,4 +297,13 @@ if __name__ == "__main__":
 
     # 4. 输出最终任务状态
     for task in tasks:
-        print(task) 
+        print(task)
+
+    # 5. 可视化AMIR聚类效果（最近20个任务）
+    scheduler.plot_amir_clustering()
+
+    # 6. 全局AMIR聚类分析与可视化（所有epoch）
+    if os.path.exists(memory_flops_path):
+        amir_list = read_amir_from_file(memory_flops_path)
+        save_path = os.path.join(amir_dir, 'amir_kmeans_full.png')
+        plot_amir_kmeans_full(amir_list, save_path) 

@@ -261,10 +261,10 @@ def plot_metrics(metrics, output_dir):
     plt.title('L1 Cache Miss Rate: Update vs Aggregation', fontsize=12)
     plt.xticks(x, categories)
     plt.legend()
-    plt.grid(True, linestyle='--', alpha=0.3)
-    plt.tight_layout()
+        plt.grid(True, linestyle='--', alpha=0.3)
+        plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'l1_cache_miss_rate_bar_comparison.png'), dpi=300, bbox_inches='tight')
-    plt.close()
+        plt.close()
         
     # 4.2 L1缓存访问次数柱状图对比
     plt.figure(figsize=(8, 6))
@@ -286,14 +286,14 @@ def plot_metrics(metrics, output_dir):
     plt.title('L1 Cache Loads: Update vs Aggregation', fontsize=12)
     plt.xticks(x, categories)
     plt.legend()
-    plt.grid(True, linestyle='--', alpha=0.3)
-    plt.yscale('log')
-    plt.tight_layout()
+        plt.grid(True, linestyle='--', alpha=0.3)
+        plt.yscale('log')
+        plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'l1_cache_loads_bar_comparison.png'), dpi=300, bbox_inches='tight')
-    plt.close()
+        plt.close()
     
     # 4.3 L1缓存缺失次数柱状图对比
-    plt.figure(figsize=(8, 6))
+        plt.figure(figsize=(8, 6))
     avg_metrics = {
         'layer1_update': np.mean(metrics['layer1_update']['l1_misses'][:min_length]),
         'layer1_aggregation': np.mean(metrics['layer1_aggregation']['l1_misses'][:min_length]),
@@ -302,21 +302,21 @@ def plot_metrics(metrics, output_dir):
     }
     update_data = [avg_metrics['layer1_update'], avg_metrics['layer2_update']]
     aggregation_data = [avg_metrics['layer1_aggregation'], avg_metrics['layer2_aggregation']]
-    x = np.arange(len(categories))
-    width = 0.35
+        x = np.arange(len(categories))
+        width = 0.35
     plt.bar(x - width/2, update_data, width, label='Update', color='#1f77b4')
     plt.bar(x + width/2, aggregation_data, width, label='Aggregation', color='#ff7f0e')
     # 不显示数值标签
     plt.xlabel('Layer', fontsize=10)
     plt.ylabel('Average L1 Cache Misses per Epoch', fontsize=10)
     plt.title('L1 Cache Misses: Update vs Aggregation', fontsize=12)
-    plt.xticks(x, categories)
-    plt.legend()
-    plt.grid(True, linestyle='--', alpha=0.3)
-    plt.yscale('log')
-    plt.tight_layout()
+        plt.xticks(x, categories)
+        plt.legend()
+        plt.grid(True, linestyle='--', alpha=0.3)
+        plt.yscale('log')
+        plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'l1_cache_misses_bar_comparison.png'), dpi=300, bbox_inches='tight')
-    plt.close()
+        plt.close()
     
     # 新增DRAM访问字节数折线图
     plt.figure(figsize=(10, 6))
