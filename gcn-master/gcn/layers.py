@@ -134,6 +134,7 @@ class GraphConvolution(Layer):
     def __init__(self, input_dim, output_dim, placeholders, dropout=0.,
                  sparse_inputs=False, act=tf.nn.relu, bias=False,
                  featureless=False, **kwargs):
+        print("Loaded GraphConvolution from:", __file__)
         super(GraphConvolution, self).__init__(**kwargs)
 
         if dropout:
@@ -160,6 +161,45 @@ class GraphConvolution(Layer):
         if self.logging:
             self._log_vars()
 
+    def _update(self, inputs):
+        """更新操作：特征变换、偏置和激活函数"""
+        layer_idx = self.name.split('_')[-1]  # e.g. graphconvolution_1 -> 1
+        if 'stage_hook' in globals():
+            stage_hook("UPDATE_BEGIN", layer_idx)
+        x = inputs
+        # dropout
+        if self.sparse_inputs:
+            x = sparse_dropout(x, 1-self.dropout, self.num_features_nonzero)
+        else:
+            x = tf.nn.dropout(x, 1-self.dropout)
+        # 特征变换
+        if not self.featureless:
+            pre_sup = dot(x, self.vars['weights_0'],
+                          sparse=self.sparse_inputs)
+        else:
+            pre_sup = self.vars['weights_0']
+        # 偏置和激活函数
+        if self.bias:
+            pre_sup += self.vars['bias']
+        result = self.act(pre_sup)
+        if 'stage_hook' in globals():
+            stage_hook("UPDATE_END", layer_idx)
+        return result
+
+    def _aggregate(self, inputs):
+        """聚合操作：邻居信息聚合"""
+        layer_idx = self.name.split('_')[-1]
+        if 'stage_hook' in globals():
+            stage_hook("AGG_BEGIN", layer_idx)
+        supports = list()
+        for i in range(len(self.support)):
+            support = dot(self.support[i], inputs, sparse=True)
+            supports.append(support)
+        result = tf.add_n(supports)
+        if 'stage_hook' in globals():
+            stage_hook("AGG_END", layer_idx)
+        return result
+
     def _call(self, inputs):
         x = inputs
 
@@ -169,7 +209,6 @@ class GraphConvolution(Layer):
         else:
             x = tf.nn.dropout(x, 1-self.dropout)
 
-        # convolve
         supports = list()
         for i in range(len(self.support)):
             if not self.featureless:
@@ -181,7 +220,6 @@ class GraphConvolution(Layer):
             supports.append(support)
         output = tf.add_n(supports)
 
-        # bias
         if self.bias:
             output += self.vars['bias']
 

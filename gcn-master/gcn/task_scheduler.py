@@ -6,56 +6,27 @@ import re
 import numpy as np
 from sklearn.cluster import KMeans
 import matplotlib.pyplot as plt
+import tensorflow as tf
+from gcn.models import GCN, MLP
+from gcn.utils import *
+
+# === 自动插入TF1.x风格flags定义 ===
+flags = tf.app.flags
+FLAGS = flags.FLAGS
+flags.DEFINE_string('dataset', 'cora', 'Dataset string.')  # 'cora', 'citeseer', 'pubmed'
+flags.DEFINE_string('model', 'gcn', 'Model string.')  # 'gcn', 'gcn_cheby', 'dense'
+flags.DEFINE_float('learning_rate', 0.01, 'Initial learning rate.')
+flags.DEFINE_integer('epochs', 200, 'Number of epochs to train.')
+flags.DEFINE_integer('hidden1', 16, 'Number of units in hidden layer 1.')
+flags.DEFINE_float('dropout', 0.5, 'Dropout rate (1 - keep probability).')
+flags.DEFINE_float('weight_decay', 5e-4, 'Weight for L2 loss on embedding matrix.')
+flags.DEFINE_integer('early_stopping', 10, 'Tolerance for early stopping (# of epochs).')
+flags.DEFINE_integer('max_degree', 3, 'Maximum Chebyshev polynomial degree.')
+# === END ===
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
-# 任务结构体
-class Task:
-    def __init__(self, task_id, AMIR, CD):
-        self.id = task_id
-        self.AMIR = AMIR
-        self.CD = CD
-        self.device = None
-        self.status = 'pending'  # pending, running, finished, fallback, failed
-
-    def __repr__(self):
-        return f"Task(id={self.id}, AMIR={self.AMIR:.4f}, CD={self.CD:.4f}, device={self.device}, status={self.status})"
-
-# 工具函数：解析performance_analysis_report.txt获取LLC_loads
-def parse_llc_loads(perf_report_path):
-    if not os.path.exists(perf_report_path):
-        return None
-    with open(perf_report_path, 'r') as f:
-        content = f.read()
-    # 尝试匹配"LLC Loads"或"LLC-loads"，或直接用"LLC-loads"字段
-    match = re.search(r'Average LLC Loads per Epoch:\s*([\deE+\.-]+)', content)
-    if match:
-        return float(match.group(1))
-    # 兼容旧格式，尝试直接找LLC-loads
-    match = re.search(r'LLC-loads:\s*([\deE+\.-]+)', content)
-    if match:
-        return float(match.group(1))
-    # 兼容直接找LLC Misses（如果没有Loads）
-    match = re.search(r'Average LLC Misses per Epoch:\s*([\deE+\.-]+)', content)
-    if match:
-        return float(match.group(1))
-    return None
-
-# 工具函数：解析flops_analysis_report.txt获取FLOPs
-# 返回dict: {'layer1_update':..., 'layer1_aggregate':..., ...}
-def parse_flops(flops_report_path):
-    if not os.path.exists(flops_report_path):
-        return None
-    flops = {}
-    with open(flops_report_path, 'r') as f:
-        for line in f:
-            m = re.match(r'(layer\d+_\w+):\s*([\deE+]+)', line)
-            if m:
-                flops[m.group(1)] = float(m.group(2))
-    return flops if flops else None
-
-# K-means聚类法自动分AMIR阈值
 def get_amir_threshold_kmeans(amir_values):
     amir_values = np.array(amir_values).reshape(-1, 1)
     kmeans = KMeans(n_clusters=2, random_state=0).fit(amir_values)
@@ -63,7 +34,6 @@ def get_amir_threshold_kmeans(amir_values):
     threshold = (centers[0] + centers[1]) / 2
     return threshold, kmeans.labels_, centers
 
-# K-means聚类法自动分CD阈值
 def get_cd_threshold_kmeans(cd_values):
     cd_values = np.array(cd_values).reshape(-1, 1)
     kmeans = KMeans(n_clusters=2, random_state=0).fit(cd_values)
@@ -71,62 +41,7 @@ def get_cd_threshold_kmeans(cd_values):
     threshold = (centers[0] + centers[1]) / 2
     return threshold, kmeans.labels_, centers
 
-# 可视化AMIR聚类效果
-def plot_amir_kmeans(amir_values, labels, centers, threshold, save_path):
-    amir_values = np.array(amir_values)
-    plt.figure(figsize=(8, 4))
-    plt.scatter(range(len(amir_values)), amir_values, c=labels, cmap='coolwarm', label='AMIR')
-    plt.axhline(threshold, color='green', linestyle='--', label=f'Threshold={threshold:.2f}')
-    plt.scatter([-1, -1], centers, c='black', marker='x', s=100, label='Centers')
-    plt.xlabel('Task Index')
-    plt.ylabel('AMIR')
-    plt.title('K-means Clustering of AMIR and Threshold')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-
-# 可视化CD聚类效果
-def plot_cd_kmeans(cd_values, labels, centers, threshold, save_path):
-    cd_values = np.array(cd_values)
-    plt.figure(figsize=(8, 4))
-    plt.scatter(range(len(cd_values)), cd_values, c=labels, cmap='coolwarm', label='CD')
-    plt.axhline(threshold, color='green', linestyle='--', label=f'Threshold={threshold:.2f}')
-    plt.scatter([-1, -1], centers, c='black', marker='x', s=100, label='Centers')
-    plt.xlabel('Task Index')
-    plt.ylabel('CD (Compute Density)')
-    plt.title('K-means Clustering of CD and Threshold')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
-
-# 任务生成器（支持真实AMIR和CD计算）
-def generate_tasks(num_tasks, perf_report_path=None, flops_report_path=None):
-    tasks = []
-    llc_loads = None
-    flops = None
-    if perf_report_path and flops_report_path:
-        llc_loads = parse_llc_loads(perf_report_path)
-        flops = parse_flops(flops_report_path)
-    for i in range(num_tasks):
-        # 默认随机
-        AMIR = round(random.uniform(1, 10), 2)
-        CD = round(random.uniform(0.5, 15), 2)
-        # 若有真实数据，优先用真实AMIR和CD
-        if llc_loads and flops:
-            # 计算真实AMIR: MemoryAccess_aggregate / FLOPs_update
-            memory_access_agg = llc_loads * 64  # 字节
-            flops_update = flops.get('layer1_update', None)
-            if memory_access_agg and flops_update and flops_update > 0:
-                AMIR = memory_access_agg / flops_update
-            # 计算真实CD: Update FLOPs / Aggregation Memory Accesses
-            if flops_update and memory_access_agg > 0:
-                CD = flops_update / memory_access_agg
-        tasks.append(Task(task_id=i, AMIR=AMIR, CD=CD))
-    return tasks
-
-# 调度器
+# === 钩子+调度器集成（支持AMIR/CD分配执行单元） ===
 class Scheduler:
     def __init__(self, amir_dir=None):
         self.history_amir = []
@@ -140,42 +55,36 @@ class Scheduler:
         self.amir_dir = amir_dir
 
     def update_thresholds(self):
-        # 更新AMIR阈值
         if len(self.history_amir) >= 20: 
             threshold, labels, centers = get_amir_threshold_kmeans(self.history_amir[-20:])
             self.amir_threshold = threshold
             self.amir_kmeans_labels = labels
             self.amir_kmeans_centers = centers
-        
-        # 更新CD阈值
         if len(self.history_cd) >= 20: 
             threshold, labels, centers = get_cd_threshold_kmeans(self.history_cd[-20:])
             self.cd_threshold = threshold
             self.cd_kmeans_labels = labels
             self.cd_kmeans_centers = centers
 
-    def schedule_task(self, task):
-        self.history_amir.append(task.AMIR)
-        self.history_cd.append(task.CD)
-        self.update_thresholds()
-        
-        # 基于AMIR和CD的调度策略
-        if task.AMIR > self.amir_threshold and task.CD < self.cd_threshold:
-            return 'PIM'  # 高内存访问强度，低计算密度 -> PIM
-        elif task.CD > self.cd_threshold:
-            return 'GPU'  # 高计算密度 -> GPU
+    def schedule_task(self, phase, value):
+        phase = phase.upper()
+        assert phase in ('AGG', 'UPDATE'), f"Unsupported phase: {phase}"
+        # 记录历史值
+        if phase == 'AGG':
+            self.history_amir.append(value)
         else:
-            return 'PNM'  # 中等情况 -> PNM
-
-    def plot_amir_clustering(self, filename='amir_kmeans_dynamic.png'):
-        if len(self.history_amir) >= 20 and self.amir_dir:
-            save_path = os.path.join(self.amir_dir, filename)
-            plot_amir_kmeans(self.history_amir[-20:], self.amir_kmeans_labels, self.amir_kmeans_centers, self.amir_threshold, save_path)
-
-    def plot_cd_clustering(self, filename='cd_kmeans_dynamic.png'):
-        if len(self.history_cd) >= 20 and self.amir_dir:
-            save_path = os.path.join(self.amir_dir, filename)
-            plot_cd_kmeans(self.history_cd[-20:], self.cd_kmeans_labels, self.cd_kmeans_centers, self.cd_threshold, save_path)
+            self.history_cd.append(value)
+        self.update_thresholds()
+        if phase == 'AGG':
+            if value > self.amir_threshold:
+                return 'PIM'
+            else:
+                return 'PNM'
+        elif phase == 'UPDATE':
+            if value > self.cd_threshold:
+                return 'GPU'
+            else:
+                return 'PNM'
 
 # 设备监控与回退
 class DeviceMonitor:
@@ -326,49 +235,228 @@ def ensure_amir_dir(base_dir, dataset):
 
 # 主流程
 if __name__ == "__main__":
-    # 可指定数据集路径
-    dataset = 'citeseer'  # 可修改为cora/citeseer/pubmed等
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    perf_report_path = os.path.join(base_dir, 'results', dataset, 'l1_cache_analysis', 'performance_analysis_report.txt')
-    flops_report_path = os.path.join(base_dir, 'results', dataset, 'tf-flops', sorted(os.listdir(os.path.join(base_dir, 'results', dataset, 'tf-flops')))[-1], 'flops_analysis_report.txt') if os.path.exists(os.path.join(base_dir, 'results', dataset, 'tf-flops')) else None
-
-    memory_flops_path = os.path.join(base_dir, 'results', dataset, 'l1_cache_analysis', 'memory_flops_epochs.txt')
-    if os.path.exists(memory_flops_path):
-        tasks = read_tasks_from_memory_flops(memory_flops_path)
-        num_tasks = len(tasks)
+    # 1. 数据加载与预处理
+    adj, features, y_train, y_val, y_test, train_mask, val_mask, test_mask = load_data(FLAGS.dataset)
+    features = preprocess_features(features)
+    if FLAGS.model == 'gcn':
+        support = [preprocess_adj(adj)]
+        num_supports = 1
+        model_func = GCN
+    elif FLAGS.model == 'gcn_cheby':
+        support = chebyshev_polynomials(adj, FLAGS.max_degree)
+        num_supports = 1 + FLAGS.max_degree
+        model_func = GCN
+    elif FLAGS.model == 'dense':
+        support = [preprocess_adj(adj)]
+        num_supports = 1
+        model_func = MLP
     else:
-        num_tasks = 200
-        tasks = generate_tasks(num_tasks, perf_report_path, flops_report_path)
-    amir_dir = ensure_amir_dir(base_dir, dataset)
-    scheduler = Scheduler(amir_dir=amir_dir)
-    monitor = DeviceMonitor()
-    fallback_manager = FallbackManager(monitor)
-    dispatcher = Dispatcher()
+        raise ValueError('Invalid argument for model: ' + str(FLAGS.model))
 
-    # 1. 调度
-    for task in tasks:
-        task.device = scheduler.schedule_task(task)
-        logging.info(f"Task {task.id} assigned to {task.device} (AMIR={task.AMIR:.4f}, CD={task.CD:.4f}, AMIR_threshold={scheduler.amir_threshold:.2f}, CD_threshold={scheduler.cd_threshold:.2f})")
+    # 2. 占位符定义
+    placeholders = {
+        'support': [tf.sparse_placeholder(tf.float32) for _ in range(num_supports)],
+        'features': tf.sparse_placeholder(tf.float32, shape=tf.constant(features[2], dtype=tf.int64)),
+        'labels': tf.placeholder(tf.float32, shape=(None, y_train.shape[1])),
+        'labels_mask': tf.placeholder(tf.int32),
+        'dropout': tf.placeholder_with_default(0., shape=()),
+        'num_features_nonzero': tf.placeholder(tf.int32)
+    }
 
-    # 2. 设备状态监控与回退
-    monitor.update_status()
-    for task in tasks:
-        if monitor.is_overloaded(task.device):
-            fallback_manager.fallback(task)
+    # 3. 模型构建
+    model = model_func(placeholders, input_dim=features[2][1], logging=True)
 
-    # 3. 分发任务
-    dispatcher.dispatch(tasks)
+    
+    # === END ===
 
-    # 4. 输出最终任务状态
-    for task in tasks:
-        print(task)
+    # 4. Session初始化
+    sess = tf.Session()
+    sess.run(tf.global_variables_initializer())
 
-    # 5. 可视化AMIR和CD聚类效果（最近20个任务）
-    scheduler.plot_amir_clustering()
-    scheduler.plot_cd_clustering()
+    # 5. feed_dict构造
+    feed_dict = construct_feed_dict(features, support, y_train, train_mask, placeholders)
+    feed_dict.update({placeholders['dropout']: FLAGS.dropout})
 
-    # 6. 全局AMIR和CD聚类分析与可视化（所有epoch）
-    if os.path.exists(memory_flops_path):
-        amir_list, cd_list = read_amir_cd_from_file(memory_flops_path)
-        save_path = os.path.join(amir_dir, 'amir_cd_kmeans_full.png')
-        plot_amir_cd_kmeans_full(amir_list, cd_list, save_path) 
+    # 6. 解析memory_flops_epochs.txt，生成每层AGG/UPDATE的特征值
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    memory_flops_path = os.path.join(base_dir, 'results', FLAGS.dataset, 'l1_cache_analysis', 'memory_flops_epochs.txt')
+    assert os.path.exists(memory_flops_path), f"{memory_flops_path} not found!"
+    tasks_info = []
+    with open(memory_flops_path, 'r') as f:
+        next(f)
+        for i, line in enumerate(f):
+            parts = line.strip().split('\t')
+            if len(parts) < 5:
+                continue
+            l1_agg_mem = float(parts[1])
+            l2_agg_mem = float(parts[2])
+            l1_update_flops = float(parts[3])
+            l2_update_flops = float(parts[4])
+            # AMIR用于AGG，CD用于UPDATE
+            if l1_update_flops > 0:
+                amir1 = l1_agg_mem / l1_update_flops
+                cd1 = l1_update_flops / l1_agg_mem if l1_agg_mem > 0 else 1.0
+            else:
+                amir1 = 1.0
+                cd1 = 1.0
+            if l2_update_flops > 0:
+                amir2 = l2_agg_mem / l2_update_flops
+                cd2 = l2_update_flops / l2_agg_mem if l2_agg_mem > 0 else 1.0
+            else:
+                amir2 = 1.0
+                cd2 = 1.0
+            # L1 AGG 使用 AMIR
+            tasks_info.append({'layer': 1, 'phase': 'UPDATE', 'value': cd1})
+            # L1 UPDATE 使用 CD
+            tasks_info.append({'layer': 1, 'phase': 'AGG', 'value': amir1})
+            # L2 AGG 使用 AMIR
+            tasks_info.append({'layer': 2, 'phase': 'UPDATE', 'value': cd2})
+            # L2 UPDATE 使用 CD
+            tasks_info.append({'layer': 2, 'phase': 'AGG', 'value': amir2})
+
+    scheduler = Scheduler()
+    current_epoch = [0]
+    stage_counter = [0]
+    stage_device_log = []
+
+    def stage_hook(stage, layer_idx, info=None):
+        # 只在每个子阶段BEGIN时调度
+        if stage.endswith('BEGIN'):
+            idx = current_epoch[0] * 4 + stage_counter[0]
+            if idx < len(tasks_info):
+                task = tasks_info[idx]
+                device = scheduler.schedule_task(task['phase'], task['value'])
+                print(f"[调度器] Epoch {current_epoch[0]+1} 子阶段{stage_counter[0]+1} (Layer {layer_idx}, {stage}): 值={task['value']:.4f}, 分配到 {device}")
+                stage_device_log.append((current_epoch[0]+1, stage_counter[0]+1, layer_idx, stage, task['value'], None, device))
+            stage_counter[0] += 1
+            if stage_counter[0] == 4:
+                stage_counter[0] = 0
+                current_epoch[0] += 1
+
+    # 7. 标准端到端训练与验证流程（与train_normal.py一致）
+    cost_val = []
+    for epoch in range(FLAGS.epochs):
+        t = time.time()
+        feed_dict = construct_feed_dict(features, support, y_train, train_mask, placeholders)
+        feed_dict.update({placeholders['dropout']: FLAGS.dropout})
+
+        # 每个epoch开始时重置子阶段计数（防止断点/早停后错乱）
+        stage_counter[0] = 0
+        current_epoch[0] = epoch
+
+        # === 新的训练步骤：分阶段执行update和aggregate ===
+        print(f"\n=== Epoch {epoch + 1} 训练开始 ===")
+        
+        # Layer 1 Update
+        print(f"Layer 1 Update - 调度任务...")
+        idx = epoch * 4 + 0  # Layer 1 Update
+        if idx < len(tasks_info):
+            task = tasks_info[idx]
+            device = scheduler.schedule_task(task['phase'], task['value'])
+            print(f"[调度器] Layer 1 Update: 值={task['value']:.4f}, 分配到 {device}")
+            stage_device_log.append((epoch+1, 1, 1, 'UPDATE', task['value'], None, device))
+            print(f"[完成] Layer 1 Update 在 {device} 上完成")
+            updated = sess.run([model.layers[0]._update(placeholders['features'])], feed_dict=feed_dict)
+        else:
+            device = scheduler.schedule_task('UPDATE', 1.0)
+            print(f"[调度器] Layer 1 Update: 值=1.0000, 分配到 {device}")
+            stage_device_log.append((epoch+1, 1, 1, 'UPDATE', 1.0, None, device))
+            print(f"[完成] Layer 1 Update 在 {device} 上完成")
+            updated = sess.run([model.layers[0]._update(placeholders['features'])], feed_dict=feed_dict)
+        
+        # Layer 1 Aggregate
+        print(f"Layer 1 Aggregate - 调度任务...")
+        idx = epoch * 4 + 1  # Layer 1 Aggregate
+        if idx < len(tasks_info):
+            task = tasks_info[idx]
+            device = scheduler.schedule_task(task['phase'], task['value'])
+            print(f"[调度器] Layer 1 Aggregate: 值={task['value']:.4f}, 分配到 {device}")
+            stage_device_log.append((epoch+1, 2, 1, 'AGG', task['value'], None, device))
+            print(f"[完成] Layer 1 Aggregate 在 {device} 上完成")
+            aggregated = sess.run([model.layers[0]._aggregate(updated[0])], feed_dict=feed_dict)
+        else:
+            device = scheduler.schedule_task('AGG', 1.0)
+            print(f"[调度器] Layer 1 Aggregate: 值=1.0000, 分配到 {device}")
+            stage_device_log.append((epoch+1, 2, 1, 'AGG', 1.0, None, device))
+            print(f"[完成] Layer 1 Aggregate 在 {device} 上完成")
+            aggregated = sess.run([model.layers[0]._aggregate(updated[0])], feed_dict=feed_dict)
+        
+        # Layer 2 Update
+        print(f"Layer 2 Update - 调度任务...")
+        idx = epoch * 4 + 2  # Layer 2 Update
+        if idx < len(tasks_info):
+            task = tasks_info[idx]
+            device = scheduler.schedule_task(task['phase'], task['value'])
+            print(f"[调度器] Layer 2 Update: 值={task['value']:.4f}, 分配到 {device}")
+            stage_device_log.append((epoch+1, 3, 2, 'UPDATE', task['value'], None, device))
+            print(f"[完成] Layer 2 Update 在 {device} 上完成")
+            updated = sess.run([model.layers[1]._update(aggregated[0])], feed_dict=feed_dict)
+        else:
+            device = scheduler.schedule_task('UPDATE', 1.0)
+            print(f"[调度器] Layer 2 Update: 值=1.0000, 分配到 {device}")
+            stage_device_log.append((epoch+1, 3, 2, 'UPDATE', 1.0, None, device))
+            print(f"[完成] Layer 2 Update 在 {device} 上完成")
+            updated = sess.run([model.layers[1]._update(aggregated[0])], feed_dict=feed_dict)
+        
+        # Layer 2 Aggregate
+        print(f"Layer 2 Aggregate - 调度任务...")
+        idx = epoch * 4 + 3  # Layer 2 Aggregate
+        if idx < len(tasks_info):
+            task = tasks_info[idx]
+            device = scheduler.schedule_task(task['phase'], task['value'])
+            print(f"[调度器] Layer 2 Aggregate: 值={task['value']:.4f}, 分配到 {device}")
+            stage_device_log.append((epoch+1, 4, 2, 'AGG', task['value'], None, device))
+            print(f"[完成] Layer 2 Aggregate 在 {device} 上完成")
+            outputs = sess.run([model.layers[1]._aggregate(updated[0])], feed_dict=feed_dict)
+        else:
+            device = scheduler.schedule_task('AGG', 1.0)
+            print(f"[调度器] Layer 2 Aggregate: 值=1.0000, 分配到 {device}")
+            stage_device_log.append((epoch+1, 4, 2, 'AGG', 1.0, None, device))
+            print(f"[完成] Layer 2 Aggregate 在 {device} 上完成")
+            outputs = sess.run([model.layers[1]._aggregate(updated[0])], feed_dict=feed_dict)
+        
+        # 计算损失和准确率
+        loss_acc = sess.run([model.loss, model.accuracy], feed_dict=feed_dict)
+        
+        # 执行反向传播更新参数
+        sess.run([model.opt_op], feed_dict=feed_dict)
+
+        # 验证集评估
+        def evaluate(features, support, labels, mask, placeholders):
+            t_test = time.time()
+            feed_dict_val = construct_feed_dict(features, support, labels, mask, placeholders)
+            outs_val = sess.run([model.loss, model.accuracy], feed_dict=feed_dict_val)
+            return outs_val[0], outs_val[1], (time.time() - t_test)
+        cost, acc, duration = evaluate(features, support, y_val, val_mask, placeholders)
+        cost_val.append(cost)
+
+        print("Epoch:", '%04d' % (epoch + 1), "train_loss=", "{:.5f}".format(loss_acc[0]),
+              "train_acc=", "{:.5f}".format(loss_acc[1]), "val_loss=", "{:.5f}".format(cost),
+              "val_acc=", "{:.5f}".format(acc), "time=", "{:.5f}".format(time.time() - t))
+
+        # Early stopping
+        if epoch > FLAGS.early_stopping and cost_val[-1] > np.mean(cost_val[-(FLAGS.early_stopping+1):-1]):
+            print("Early stopping...")
+            break
+
+    print("Optimization Finished!")
+
+    # 输出调度日志
+    print("\n=== 调度器阶段分配日志 ===")
+    for log in stage_device_log:
+        print(f"Epoch {log[0]} 阶段{log[1]} (Layer {log[2]} {log[3]}): 值={log[4]:.4f}, 分配到 {log[6]}")
+
+    # 测试集评估
+    test_cost, test_acc, test_duration = evaluate(features, support, y_test, test_mask, placeholders)
+    print("Test set results:", "cost=", "{:.5f}".format(test_cost),
+          "accuracy=", "{:.5f}".format(test_acc), "time=", "{:.5f}".format(test_duration))
+
+    # 8. 全局AMIR和CD聚类分析与可视化
+    amir_dir = os.path.join(base_dir, 'results', FLAGS.dataset, 'AMIR')
+    os.makedirs(amir_dir, exist_ok=True)
+    amir_list, cd_list = read_amir_cd_from_file(memory_flops_path)
+    save_path = os.path.join(amir_dir, 'amir_cd_kmeans_full.png')
+    plot_amir_cd_kmeans_full(amir_list, cd_list, save_path)
+
+    # 8. 可视化、聚类等分析（可复用原有代码）
+    # ... 
