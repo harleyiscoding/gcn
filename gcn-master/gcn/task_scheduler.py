@@ -458,5 +458,3 @@ if __name__ == "__main__":
     save_path = os.path.join(amir_dir, 'amir_cd_kmeans_full.png')
     plot_amir_cd_kmeans_full(amir_list, cd_list, save_path)
 
-    # 8. 可视化、聚类等分析（可复用原有代码）
-    # ... 
