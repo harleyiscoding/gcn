@@ -92,7 +92,8 @@ def extract_subgraph_data(adj, features, y_train, y_val, y_test,
         'y_test_sub': y_test_sub,
         'train_mask_sub': train_mask_sub,
         'val_mask_sub': val_mask_sub,
-        'test_mask_sub': test_mask_sub
+        'test_mask_sub': test_mask_sub,
+        'part_nodes': part_nodes
     }
 
 def extract_all_partition_subgraphs(adj, features, y_train, y_val, y_test,

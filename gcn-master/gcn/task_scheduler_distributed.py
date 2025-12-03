@@ -239,10 +239,90 @@ def ensure_amir_dir(base_dir, dataset):
     os.makedirs(amir_dir, exist_ok=True)
     return amir_dir
 
+def _ensure_np_array(indices):
+    return np.array(indices, dtype=np.int64)
+
+def map_features_to_global(features_tuple, part_nodes, num_nodes, num_features):
+    """将子图特征三元组映射到全图形状"""
+    coords, values, _ = features_tuple
+    part_nodes = _ensure_np_array(part_nodes)
+    if coords.size == 0:
+        new_coords = coords.reshape(0, 2).astype(np.int64)
+    else:
+        new_coords = coords.copy().astype(np.int64)
+        new_coords[:, 0] = part_nodes[new_coords[:, 0]]
+    return (new_coords, values, (num_nodes, num_features))
+
+def map_support_to_global(support_tuple, part_nodes, num_nodes):
+    """将子图邻接三元组映射到全图形状"""
+    coords, values, _ = support_tuple
+    part_nodes = _ensure_np_array(part_nodes)
+    if coords.size == 0:
+        new_coords = coords.reshape(0, 2).astype(np.int64)
+    else:
+        new_coords = coords.copy().astype(np.int64)
+        new_coords[:, 0] = part_nodes[new_coords[:, 0]]
+        new_coords[:, 1] = part_nodes[new_coords[:, 1]]
+    return (new_coords, values, (num_nodes, num_nodes))
+
+def expand_labels_to_global(labels_sub, part_nodes, num_nodes):
+    labels_global = np.zeros((num_nodes, labels_sub.shape[1]), dtype=labels_sub.dtype)
+    labels_global[_ensure_np_array(part_nodes)] = labels_sub
+    return labels_global
+
+def expand_mask_to_global(mask_sub, part_nodes, num_nodes):
+    mask_global = np.zeros(num_nodes, dtype=mask_sub.dtype)
+    mask_global[_ensure_np_array(part_nodes)] = mask_sub
+    return mask_global
+
 # 主流程
 if __name__ == "__main__":
     # 1. 数据加载与预处理
     adj, features, y_train, y_val, y_test, train_mask, val_mask, test_mask = load_data(FLAGS.dataset)
+
+    # === 新增：子图划分与压缩 ===
+    num_parts = FLAGS.num_parts if hasattr(FLAGS, 'num_parts') else 4
+    part_labels = metis_partition(adj, num_parts)
+    partition_masks = get_partition_masks(part_labels, num_parts)
+    subgraph_list = extract_all_partition_subgraphs(
+        adj, features, y_train, y_val, y_test, train_mask, val_mask, test_mask, partition_masks)
+
+    # 预处理 & 压缩子图（只做一次）
+    for i, subgraph in enumerate(subgraph_list):
+        # 压缩邻接矩阵
+        adj_sub = subgraph['adj_sub']
+        indptr, indices_bytes, data = compress_csr_with_delta_varint(adj_sub)
+        subgraph['adj_compressed'] = (indptr, indices_bytes, data, adj_sub.shape)
+        # 压缩特征
+        features_sub = subgraph['features_sub']
+        subgraph['features_compressed'] = auto_compress_features(features_sub)
+        # 预先计算映射到全图的三元组和标签/掩码
+        part_nodes = _ensure_np_array(subgraph['part_nodes'])
+        adj_sub_dec = decompress_csr_with_delta_varint(*subgraph['adj_compressed'])
+        features_sub_dec = auto_decompress_features(subgraph['features_compressed'])
+        features_sub_tuple = preprocess_features(features_sub_dec)
+        support_sub = [preprocess_adj(adj_sub_dec)]
+        features_global = map_features_to_global(features_sub_tuple, part_nodes, adj.shape[0], features.shape[1])
+        support_global = [map_support_to_global(s, part_nodes, adj.shape[0]) for s in support_sub]
+        y_train_global = expand_labels_to_global(subgraph['y_train_sub'], part_nodes, adj.shape[0])
+        y_val_global = expand_labels_to_global(subgraph['y_val_sub'], part_nodes, adj.shape[0])
+        y_test_global = expand_labels_to_global(subgraph['y_test_sub'], part_nodes, adj.shape[0])
+        train_mask_global = expand_mask_to_global(subgraph['train_mask_sub'], part_nodes, adj.shape[0])
+        val_mask_global = expand_mask_to_global(subgraph['val_mask_sub'], part_nodes, adj.shape[0])
+        test_mask_global = expand_mask_to_global(subgraph['test_mask_sub'], part_nodes, adj.shape[0])
+        subgraph['cached_global'] = {
+            'features_global': features_global,
+            'support_global': support_global,
+            'y_train_global': y_train_global,
+            'y_val_global': y_val_global,
+            'y_test_global': y_test_global,
+            'train_mask_global': train_mask_global,
+            'val_mask_global': val_mask_global,
+            'test_mask_global': test_mask_global,
+            'part_nodes': part_nodes,
+        }
+
+    # 全局特征和support也预处理为三元组
     features = preprocess_features(features)
     if FLAGS.model == 'gcn':
         support = [preprocess_adj(adj)]
@@ -259,14 +339,16 @@ if __name__ == "__main__":
     else:
         raise ValueError('Invalid argument for model: ' + str(FLAGS.model))
 
-    # 2. 占位符定义
+    # 2. 占位符定义（用三元组shape，num_features_nonzero shape=[1]）
+    num_nodes, num_features = features[2]
+    num_classes = y_train.shape[1]
     placeholders = {
-        'support': [tf.sparse_placeholder(tf.float32) for _ in range(num_supports)],
-        'features': tf.sparse_placeholder(tf.float32, shape=tf.constant(features[2], dtype=tf.int64)),
-        'labels': tf.placeholder(tf.float32, shape=(None, y_train.shape[1])),
+        'support': [tf.sparse_placeholder(tf.float32, shape=(num_nodes, num_nodes)) for _ in range(num_supports)],
+        'features': tf.sparse_placeholder(tf.float32, shape=(num_nodes, num_features)),
+        'labels': tf.placeholder(tf.float32, shape=(None, num_classes)),
         'labels_mask': tf.placeholder(tf.int32),
         'dropout': tf.placeholder_with_default(0., shape=()),
-        'num_features_nonzero': tf.placeholder(tf.int32)
+        'num_features_nonzero': tf.placeholder(tf.int32, shape=[1])
     }
 
     # 3. 模型构建
@@ -279,9 +361,18 @@ if __name__ == "__main__":
     sess = tf.Session()
     sess.run(tf.global_variables_initializer())
 
-    # 5. feed_dict构造
-    feed_dict = construct_feed_dict(features, support, y_train, train_mask, placeholders)
-    feed_dict.update({placeholders['dropout']: FLAGS.dropout})
+    # 5. feed_dict构造（用三元组和SparseTensorValue，num_features_nonzero为[coords.shape[0]]）
+    def construct_feed_dict(features, support, labels, mask, placeholders):
+        feed_dict = dict()
+        feed_dict.update({placeholders['labels']: labels})
+        feed_dict.update({placeholders['labels_mask']: mask})
+        coords, values, shape = features
+        feed_dict.update({placeholders['features']: tf.SparseTensorValue(coords, values, shape)})
+        feed_dict.update({placeholders['num_features_nonzero']: [coords.shape[0]]})
+        for i in range(len(support)):
+            coords, values, shape = support[i]
+            feed_dict.update({placeholders['support'][i]: tf.SparseTensorValue(coords, values, shape)})
+        return feed_dict
 
     # 6. 解析memory_flops_epochs.txt，生成每层AGG/UPDATE的特征值
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -339,112 +430,121 @@ if __name__ == "__main__":
                 stage_counter[0] = 0
                 current_epoch[0] += 1
 
-    # 7. 标准端到端训练与验证流程（与train_normal.py一致）
+    # 7. 只保留分区子图训练与推理流程
     cost_val = []
+    all_subgraph_results = []  # 用于子图推理结果收集
+    early_stop = False  # 新增early stopping flag
     for epoch in range(FLAGS.epochs):
         t = time.time()
-        feed_dict = construct_feed_dict(features, support, y_train, train_mask, placeholders)
-        feed_dict.update({placeholders['dropout']: FLAGS.dropout})
+        print(f"\n=== Epoch {epoch + 1} 子图分区训练模式 ===")
+        for part_id, subgraph in enumerate(subgraph_list):
+            cached = subgraph['cached_global']
+            features_global = cached['features_global']
+            support_global = cached['support_global']
+            y_train_global = cached['y_train_global']
+            y_val_global = cached['y_val_global']
+            y_test_global = cached['y_test_global']
+            train_mask_global = cached['train_mask_global']
+            val_mask_global = cached['val_mask_global']
+            test_mask_global = cached['test_mask_global']
+            part_nodes = cached['part_nodes']
 
-        # 每个epoch开始时重置子阶段计数（防止断点/早停后错乱）
-        stage_counter[0] = 0
-        current_epoch[0] = epoch
+            # 构造 feed_dict
+            feed_dict = construct_feed_dict(features_global, support_global, y_train_global, train_mask_global, placeholders)
+            feed_dict.update({placeholders['dropout']: FLAGS.dropout})
 
-        # === 新的训练步骤：分阶段执行update和aggregate ===
-        print(f"\n=== Epoch {epoch + 1} 训练开始 ===")
-        
-        # Layer 1 Update
-        print(f"Layer 1 Update - 调度任务...")
-        idx = epoch * 4 + 0  # Layer 1 Update
-        if idx < len(tasks_info):
-            task = tasks_info[idx]
-            device = scheduler.schedule_task(task['phase'], task['value'])
-            print(f"[调度器] Layer 1 Update: 值={task['value']:.4f}, 分配到 {device}")
-            stage_device_log.append((epoch+1, 1, 1, 'UPDATE', task['value'], None, device))
-            print(f"[完成] Layer 1 Update 在 {device} 上完成")
-            updated = sess.run([model.layers[0]._update(placeholders['features'])], feed_dict=feed_dict)
-        else:
-            device = scheduler.schedule_task('UPDATE', 1.0)
-            print(f"[调度器] Layer 1 Update: 值=1.0000, 分配到 {device}")
-            stage_device_log.append((epoch+1, 1, 1, 'UPDATE', 1.0, None, device))
-            print(f"[完成] Layer 1 Update 在 {device} 上完成")
-            updated = sess.run([model.layers[0]._update(placeholders['features'])], feed_dict=feed_dict)
-        
-        # Layer 1 Aggregate
-        print(f"Layer 1 Aggregate - 调度任务...")
-        idx = epoch * 4 + 1  # Layer 1 Aggregate
-        if idx < len(tasks_info):
-            task = tasks_info[idx]
-            device = scheduler.schedule_task(task['phase'], task['value'])
-            print(f"[调度器] Layer 1 Aggregate: 值={task['value']:.4f}, 分配到 {device}")
-            stage_device_log.append((epoch+1, 2, 1, 'AGG', task['value'], None, device))
-            print(f"[完成] Layer 1 Aggregate 在 {device} 上完成")
-            aggregated = sess.run([model.layers[0]._aggregate(updated[0])], feed_dict=feed_dict)
-        else:
-            device = scheduler.schedule_task('AGG', 1.0)
-            print(f"[调度器] Layer 1 Aggregate: 值=1.0000, 分配到 {device}")
-            stage_device_log.append((epoch+1, 2, 1, 'AGG', 1.0, None, device))
-            print(f"[完成] Layer 1 Aggregate 在 {device} 上完成")
-            aggregated = sess.run([model.layers[0]._aggregate(updated[0])], feed_dict=feed_dict)
-        
-        # Layer 2 Update
-        print(f"Layer 2 Update - 调度任务...")
-        idx = epoch * 4 + 2  # Layer 2 Update
-        if idx < len(tasks_info):
-            task = tasks_info[idx]
-            device = scheduler.schedule_task(task['phase'], task['value'])
-            print(f"[调度器] Layer 2 Update: 值={task['value']:.4f}, 分配到 {device}")
-            stage_device_log.append((epoch+1, 3, 2, 'UPDATE', task['value'], None, device))
-            print(f"[完成] Layer 2 Update 在 {device} 上完成")
-            updated = sess.run([model.layers[1]._update(aggregated[0])], feed_dict=feed_dict)
-        else:
-            device = scheduler.schedule_task('UPDATE', 1.0)
-            print(f"[调度器] Layer 2 Update: 值=1.0000, 分配到 {device}")
-            stage_device_log.append((epoch+1, 3, 2, 'UPDATE', 1.0, None, device))
-            print(f"[完成] Layer 2 Update 在 {device} 上完成")
-            updated = sess.run([model.layers[1]._update(aggregated[0])], feed_dict=feed_dict)
-        
-        # Layer 2 Aggregate
-        print(f"Layer 2 Aggregate - 调度任务...")
-        idx = epoch * 4 + 3  # Layer 2 Aggregate
-        if idx < len(tasks_info):
-            task = tasks_info[idx]
-            device = scheduler.schedule_task(task['phase'], task['value'])
-            print(f"[调度器] Layer 2 Aggregate: 值={task['value']:.4f}, 分配到 {device}")
-            stage_device_log.append((epoch+1, 4, 2, 'AGG', task['value'], None, device))
-            print(f"[完成] Layer 2 Aggregate 在 {device} 上完成")
-            outputs = sess.run([model.layers[1]._aggregate(updated[0])], feed_dict=feed_dict)
-        else:
-            device = scheduler.schedule_task('AGG', 1.0)
-            print(f"[调度器] Layer 2 Aggregate: 值=1.0000, 分配到 {device}")
-            stage_device_log.append((epoch+1, 4, 2, 'AGG', 1.0, None, device))
-            print(f"[完成] Layer 2 Aggregate 在 {device} 上完成")
-            outputs = sess.run([model.layers[1]._aggregate(updated[0])], feed_dict=feed_dict)
-        
-        # 计算损失和准确率
-        loss_acc = sess.run([model.loss, model.accuracy], feed_dict=feed_dict)
-        
-        # 执行反向传播更新参数
-        sess.run([model.opt_op], feed_dict=feed_dict)
+            # 每个epoch开始时重置子阶段计数（防止断点/早停后错乱）
+            stage_counter[0] = 0
+            current_epoch[0] = epoch
 
-        # 验证集评估
-        def evaluate(features, support, labels, mask, placeholders):
-            t_test = time.time()
-            feed_dict_val = construct_feed_dict(features, support, labels, mask, placeholders)
-            outs_val = sess.run([model.loss, model.accuracy], feed_dict=feed_dict_val)
-            return outs_val[0], outs_val[1], (time.time() - t_test)
-        cost, acc, duration = evaluate(features, support, y_val, val_mask, placeholders)
-        cost_val.append(cost)
+            # === 分阶段执行update和aggregate（与全局一致） ===
+            # Layer 1 Update
+            idx = epoch * 4 + 0
+            if idx < len(tasks_info):
+                task = tasks_info[idx]
+                device = scheduler.schedule_task(task['phase'], task['value'])
+                print(f"[调度器] Layer 1 Update: 值={task['value']:.4f}, 分配到 {device}")
+                stage_device_log.append((epoch+1, 1, 1, 'UPDATE', task['value'], part_id, device))
+                print(f"[完成] Layer 1 Update 在 {device} 上完成 (Partition {part_id})")
+                updated = sess.run([model.layers[0]._update(placeholders['features'])], feed_dict=feed_dict)
+            else:
+                device = scheduler.schedule_task('UPDATE', 1.0)
+                print(f"[调度器] Layer 1 Update: 值=1.0000, 分配到 {device}")
+                stage_device_log.append((epoch+1, 1, 1, 'UPDATE', 1.0, part_id, device))
+                print(f"[完成] Layer 1 Update 在 {device} 上完成 (Partition {part_id})")
+                updated = sess.run([model.layers[0]._update(placeholders['features'])], feed_dict=feed_dict)
 
-        print("Epoch:", '%04d' % (epoch + 1), "train_loss=", "{:.5f}".format(loss_acc[0]),
-              "train_acc=", "{:.5f}".format(loss_acc[1]), "val_loss=", "{:.5f}".format(cost),
-              "val_acc=", "{:.5f}".format(acc), "time=", "{:.5f}".format(time.time() - t))
+            # Layer 1 Aggregate
+            idx = epoch * 4 + 1
+            if idx < len(tasks_info):
+                task = tasks_info[idx]
+                device = scheduler.schedule_task(task['phase'], task['value'])
+                print(f"[调度器] Layer 1 Aggregate: 值={task['value']:.4f}, 分配到 {device}")
+                stage_device_log.append((epoch+1, 2, 1, 'AGG', task['value'], part_id, device))
+                print(f"[完成] Layer 1 Aggregate 在 {device} 上完成 (Partition {part_id})")
+                aggregated = sess.run([model.layers[0]._aggregate(updated[0])], feed_dict=feed_dict)
+            else:
+                device = scheduler.schedule_task('AGG', 1.0)
+                print(f"[调度器] Layer 1 Aggregate: 值=1.0000, 分配到 {device}")
+                stage_device_log.append((epoch+1, 2, 1, 'AGG', 1.0, part_id, device))
+                print(f"[完成] Layer 1 Aggregate 在 {device} 上完成 (Partition {part_id})")
+                aggregated = sess.run([model.layers[0]._aggregate(updated[0])], feed_dict=feed_dict)
 
-        # Early stopping
-        if epoch > FLAGS.early_stopping and cost_val[-1] > np.mean(cost_val[-(FLAGS.early_stopping+1):-1]):
-            print("Early stopping...")
+            # Layer 2 Update
+            idx = epoch * 4 + 2
+            if idx < len(tasks_info):
+                task = tasks_info[idx]
+                device = scheduler.schedule_task(task['phase'], task['value'])
+                print(f"[调度器] Layer 2 Update: 值={task['value']:.4f}, 分配到 {device}")
+                stage_device_log.append((epoch+1, 3, 2, 'UPDATE', task['value'], part_id, device))
+                print(f"[完成] Layer 2 Update 在 {device} 上完成 (Partition {part_id})")
+                updated = sess.run([model.layers[1]._update(aggregated[0])], feed_dict=feed_dict)
+            else:
+                device = scheduler.schedule_task('UPDATE', 1.0)
+                print(f"[调度器] Layer 2 Update: 值=1.0000, 分配到 {device}")
+                stage_device_log.append((epoch+1, 3, 2, 'UPDATE', 1.0, part_id, device))
+                print(f"[完成] Layer 2 Update 在 {device} 上完成 (Partition {part_id})")
+                updated = sess.run([model.layers[1]._update(aggregated[0])], feed_dict=feed_dict)
+
+            # Layer 2 Aggregate
+            idx = epoch * 4 + 3
+            if idx < len(tasks_info):
+                task = tasks_info[idx]
+                device = scheduler.schedule_task(task['phase'], task['value'])
+                print(f"[调度器] Layer 2 Aggregate: 值={task['value']:.4f}, 分配到 {device}")
+                stage_device_log.append((epoch+1, 4, 2, 'AGG', task['value'], part_id, device))
+                print(f"[完成] Layer 2 Aggregate 在 {device} 上完成 (Partition {part_id})")
+                outputs = sess.run([model.layers[1]._aggregate(updated[0])], feed_dict=feed_dict)
+            else:
+                device = scheduler.schedule_task('AGG', 1.0)
+                print(f"[调度器] Layer 2 Aggregate: 值=1.0000, 分配到 {device}")
+                stage_device_log.append((epoch+1, 4, 2, 'AGG', 1.0, part_id, device))
+                print(f"[完成] Layer 2 Aggregate 在 {device} 上完成 (Partition {part_id})")
+                outputs = sess.run([model.layers[1]._aggregate(updated[0])], feed_dict=feed_dict)
+
+            # 损失和准确率
+            loss_acc = sess.run([model.loss, model.accuracy], feed_dict=feed_dict)
+            sess.run([model.opt_op], feed_dict=feed_dict)
+            # 验证集评估
+            def evaluate(features, support, labels, mask, placeholders):
+                t_test = time.time()
+                feed_dict_val = construct_feed_dict(features, support, labels, mask, placeholders)
+                outs_val = sess.run([model.loss, model.accuracy], feed_dict=feed_dict_val)
+                return outs_val[0], outs_val[1], (time.time() - t_test)
+            cost, acc, duration = evaluate(features_global, support_global, y_val_global, val_mask_global, placeholders)
+            cost_val.append(cost)
+            print(f"Partition {part_id} Epoch: {epoch+1:04d} train_loss={loss_acc[0]:.5f} train_acc={loss_acc[1]:.5f} val_loss={cost:.5f} val_acc={acc:.5f} time={time.time()-t:.5f}")
+            if epoch > FLAGS.early_stopping and cost_val[-1] > np.mean(cost_val[-(FLAGS.early_stopping+1):-1]):
+                print("Early stopping...")
+                early_stop = True
+                break
+            # 测试推理，收集预测
+            feed_dict_test = construct_feed_dict(features_global, support_global, y_test_global, test_mask_global, placeholders)
+            y_pred_sub = sess.run(model.outputs, feed_dict=feed_dict_test)
+            all_subgraph_results.append((part_nodes, y_pred_sub[part_nodes]))
+        if early_stop:
             break
-
+        print("Optimization Finished for all partitions in Epoch", epoch+1)
     print("Optimization Finished!")
 
     # 输出调度日志
@@ -452,10 +552,20 @@ if __name__ == "__main__":
     for log in stage_device_log:
         print(f"Epoch {log[0]} 阶段{log[1]} (Layer {log[2]} {log[3]}): 值={log[4]:.4f}, 分配到 {log[6]}")
 
-    # 测试集评估
-    test_cost, test_acc, test_duration = evaluate(features, support, y_test, test_mask, placeholders)
-    print("Test set results:", "cost=", "{:.5f}".format(test_cost),
-          "accuracy=", "{:.5f}".format(test_acc), "time=", "{:.5f}".format(test_duration))
+    # 只保留子图分区推理与评估
+    print("\n=== 子图分区推理与评估 ===")
+    all_subgraph_results = []
+    for part_id, subgraph in enumerate(subgraph_list):
+        cached = subgraph['cached_global']
+        features_global = cached['features_global']
+        support_global = cached['support_global']
+        y_test_global = cached['y_test_global']
+        test_mask_global = cached['test_mask_global']
+        part_nodes = cached['part_nodes']
+        feed_dict_test = construct_feed_dict(features_global, support_global, y_test_global, test_mask_global, placeholders)
+        y_pred_sub = sess.run(model.outputs, feed_dict=feed_dict_test)
+        all_subgraph_results.append((part_nodes, y_pred_sub[part_nodes]))
+    print("子图推理结果已收集，总分区数：", len(all_subgraph_results))
 
     # 8. 全局AMIR和CD聚类分析与可视化
     amir_dir = os.path.join(base_dir, 'results', FLAGS.dataset, 'AMIR')
