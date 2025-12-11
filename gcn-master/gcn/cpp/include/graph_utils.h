@@ -11,6 +11,11 @@
 #include <Eigen/Sparse>
 #include <vector>
 
+// METIS 库支持（可选）
+#ifdef HAVE_METIS
+#include <metis.h>
+#endif
+
 // ==================== 图预处理 ====================
 
 class GraphUtils {

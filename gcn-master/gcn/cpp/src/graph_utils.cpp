@@ -5,6 +5,12 @@
 #include "../include/graph_utils.h"
 #include <algorithm>
 #include <cmath>
+#include <iostream>
+#include <cstring>
+
+#ifdef HAVE_METIS
+#include <metis.h>
+#endif
 
 SparseMatrix<float> GraphUtils::normalize_adj(const SparseMatrix<float>& adj) {
     int n = adj.rows();
@@ -132,14 +138,126 @@ std::vector<std::vector<int>> PartitionUtils::adj_to_metis(const SparseMatrix<fl
 }
 
 std::vector<int> PartitionUtils::metis_partition(const SparseMatrix<float>& adj, int num_parts) {
-    // TODO: 调用 METIS C 库进行分区
-    // 这里先返回简单的划分（按顺序）
     int n = adj.rows();
     std::vector<int> part_labels(n);
     
+    // 如果只有一个分区，直接返回
+    if (num_parts <= 1) {
+        std::fill(part_labels.begin(), part_labels.end(), 0);
+        return part_labels;
+    }
+    
+#ifdef HAVE_METIS
+    // 使用真实的 METIS 库进行分区
+    // 将 Eigen 稀疏矩阵转换为 METIS 需要的 CSR 格式
+    // METIS 需要：xadj (索引指针数组) 和 adjncy (邻接节点数组)
+    std::vector<idx_t> xadj(n + 1);
+    std::vector<idx_t> adjncy;
+    
+    xadj[0] = 0;
+    for (int i = 0; i < n; i++) {
+        int count = 0;
+        for (SparseMatrix<float>::InnerIterator it(adj, i); it; ++it) {
+            // 只添加非零边（METIS 不需要自环，但可以包含）
+            if (it.value() != 0.0f) {
+                adjncy.push_back(static_cast<idx_t>(it.col()));
+                count++;
+            }
+        }
+        xadj[i + 1] = xadj[i] + count;
+    }
+    
+    // METIS 参数
+    idx_t nvtxs = static_cast<idx_t>(n);           // 节点数
+    idx_t ncon = 1;                                // 约束数（通常为 1）
+    idx_t* xadj_ptr = xadj.data();                 // CSR 索引指针
+    idx_t* adjncy_ptr = adjncy.data();             // CSR 邻接节点
+    idx_t* vwgt = nullptr;                          // 节点权重（可选）
+    idx_t* vsize = nullptr;                         // 节点大小（可选）
+    idx_t* adjwgt = nullptr;                        // 边权重（可选）
+    idx_t nparts = static_cast<idx_t>(num_parts);   // 分区数
+    real_t* tpwgts = nullptr;                       // 目标分区权重（可选）
+    real_t* ubvec = nullptr;                        // 不平衡容忍度（可选）
+    idx_t options[METIS_NOPTIONS];                  // 选项数组
+    METIS_SetDefaultOptions(options);               // 设置默认选项
+    // 设置分区质量选项
+    options[METIS_OPTION_OBJTYPE] = METIS_OBJTYPE_CUT;  // 最小化边割（edge cuts）
+    options[METIS_OPTION_NCUTS] = 1;                     // 尝试次数（可以增加以获得更好结果）
+    options[METIS_OPTION_NITER] = 10;                    // 迭代次数（默认 10）
+    options[METIS_OPTION_UFACTOR] = 1;                   // 不平衡因子（1% 不平衡容忍度）
+    idx_t objval;                                   // 输出：分区质量指标
+    idx_t* part = new idx_t[n];                     // 输出：分区标签
+    
+    // 调用 METIS_PartGraphKway 进行 K-way 分区
+    int ret = METIS_PartGraphKway(
+        &nvtxs,      // 节点数
+        &ncon,       // 约束数
+        xadj_ptr,    // CSR 索引指针
+        adjncy_ptr,  // CSR 邻接节点
+        vwgt,        // 节点权重
+        vsize,       // 节点大小
+        adjwgt,      // 边权重
+        &nparts,     // 分区数
+        tpwgts,      // 目标分区权重
+        ubvec,       // 不平衡容忍度
+        options,     // 选项数组
+        &objval,     // 输出：分区质量
+        part         // 输出：分区标签
+    );
+    
+    if (ret == METIS_OK) {
+        // 转换结果
+        for (int i = 0; i < n; i++) {
+            part_labels[i] = static_cast<int>(part[i]);
+        }
+        
+        // 验证分区质量：计算实际的边割数
+        int actual_edge_cuts = 0;
+        for (int i = 0; i < n; i++) {
+            for (SparseMatrix<float>::InnerIterator it(adj, i); it; ++it) {
+                int j = it.col();
+                if (part_labels[i] != part_labels[j]) {
+                    actual_edge_cuts++;
+                }
+            }
+        }
+        // 每条边被计算两次（i->j 和 j->i），所以除以 2
+        actual_edge_cuts /= 2;
+        
+        // 计算每个分区的大小
+        std::vector<int> part_sizes(num_parts, 0);
+        for (int i = 0; i < n; i++) {
+            part_sizes[part_labels[i]]++;
+        }
+        
+        std::cout << "[METIS] Graph partitioned into " << num_parts 
+                  << " parts (objval=" << objval << ", actual_edge_cuts=" 
+                  << actual_edge_cuts << ")" << std::endl;
+        std::cout << "[METIS] Partition sizes: ";
+        for (int p = 0; p < num_parts; p++) {
+            std::cout << "P" << p << "=" << part_sizes[p];
+            if (p < num_parts - 1) std::cout << ", ";
+        }
+        std::cout << std::endl;
+        
+    } else {
+        // METIS 失败，回退到简单分区
+        std::cerr << "[METIS] Partition failed (ret=" << ret 
+                  << "), using simple partition" << std::endl;
+        for (int i = 0; i < n; i++) {
+            part_labels[i] = i % num_parts;
+        }
+    }
+    
+    delete[] part;
+    
+#else
+    // 如果没有 METIS 库，使用简单分区（按顺序）
+    std::cout << "[METIS] METIS library not available, using simple partition" << std::endl;
     for (int i = 0; i < n; i++) {
         part_labels[i] = i % num_parts;
     }
+#endif
     
     return part_labels;
 }

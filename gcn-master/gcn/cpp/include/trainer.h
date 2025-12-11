@@ -28,7 +28,7 @@ private:
     std::vector<StageLog> stage_device_log;
     
     // 从文件读取任务信息（AMIR/CD 值）
-    void load_tasks_info(const std::string& memory_flops_path);
+    void load_tasks_info(const std::string& dataset);
     
     // 执行一个阶段（Update 或 Aggregate）
     MatrixXf exec_stage(

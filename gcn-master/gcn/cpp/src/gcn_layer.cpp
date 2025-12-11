@@ -8,10 +8,10 @@
 
 // ==================== GCNLayer 实现 ====================
 
-GCNLayer::GCNLayer(int input_dim, int output_dim, bool use_bias, 
-                   float dropout, unsigned int seed)
-    : use_bias(use_bias), dropout_rate(dropout), training(true),
-      rng(seed), dropout_dist(0.0f, 1.0f) {
+GCNLayer::GCNLayer(int input_dim, int output_dim, std::mt19937& rng_ref,
+                   bool use_bias, float dropout, bool use_relu)
+    : use_bias(use_bias), dropout_rate(dropout), training(true), use_relu(use_relu),
+      rng(rng_ref), dropout_dist(0.0f, 1.0f) {
     initialize_weights(input_dim, output_dim);
     if (use_bias) {
         bias = VectorXf::Zero(output_dim);
@@ -19,28 +19,51 @@ GCNLayer::GCNLayer(int input_dim, int output_dim, bool use_bias,
 }
 
 void GCNLayer::initialize_weights(int input_dim, int output_dim) {
-    // Xavier 初始化
-    float scale = std::sqrt(2.0f / (input_dim + output_dim));
-    weight = MatrixXf::Random(input_dim, output_dim) * scale;
+    // Glorot Uniform 初始化（与 TF 一致）
+    float limit = std::sqrt(6.0f / (input_dim + output_dim));
+    std::uniform_real_distribution<float> dist(-limit, limit);
+    weight.resize(input_dim, output_dim);
+    for (int i = 0; i < input_dim; ++i) {
+        for (int j = 0; j < output_dim; ++j) {
+            weight(i, j) = dist(rng);
+        }
+    }
 }
 
 MatrixXf GCNLayer::update(const MatrixXf& features) {
-    // H' = H * W + b
-    MatrixXf output = features * weight;
+    // 与 Python GraphConvolution 完全一致：
+    // 1. dropout 输入（在 transform 之前）
+    // 2. transform: H' = H * W + b
+    // 3. ReLU 激活（如果启用）
+    // 注意：Python 中 dropout 是在输入上做的，不是输出
+    
+    MatrixXf x = features;
+    
+    // Dropout 输入（仅在训练时）
+    if (training && dropout_rate > 0.0f) {
+        x = apply_dropout(x, dropout_rate);
+    } else {
+        // 推理或未启用 dropout 时，使用单位 mask，便于反向传播
+        dropout_mask = MatrixXf::Ones(x.rows(), x.cols());
+    }
+    
+    // Transform: H' = H * W + b
+    last_linear = x * weight;
     
     if (use_bias) {
-        output.rowwise() += bias.transpose();
+        last_linear.rowwise() += bias.transpose();
     }
     
-    // ReLU 激活
-    output = relu(output);
-    
-    // Dropout（仅在训练时）
-    if (training && dropout_rate > 0.0f) {
-        output = apply_dropout(output, dropout_rate);
+    // ReLU 激活（如果启用，保存 mask 用于反向传播）
+    if (use_relu) {
+        relu_mask = (last_linear.array() > 0.0f).cast<float>();
+        MatrixXf output = relu(last_linear);
+        return output;
+    } else {
+        // 第二层不使用 ReLU（identity activation）
+        relu_mask = MatrixXf::Ones(last_linear.rows(), last_linear.cols());
+        return last_linear;
     }
-    
-    return output;
 }
 
 MatrixXf GCNLayer::aggregate(const SparseMatrix<float>& adj_norm, 
@@ -54,17 +77,30 @@ MatrixXf GCNLayer::relu(const MatrixXf& x) {
 }
 
 MatrixXf GCNLayer::apply_dropout(const MatrixXf& x, float rate) {
-    MatrixXf mask = MatrixXf::Random(x.rows(), x.cols());
-    mask = (mask.array() > rate).cast<float>();
-    return x.cwiseProduct(mask) / (1.0f - rate);
+    if (rate <= 0.0f) {
+        return x;
+    }
+    
+    dropout_mask.resize(x.rows(), x.cols());
+    for (int i = 0; i < x.rows(); ++i) {
+        for (int j = 0; j < x.cols(); ++j) {
+            dropout_mask(i, j) = (dropout_dist(rng) > rate) ? 1.0f : 0.0f;
+        }
+    }
+    // 反向传播时也复用同一个 mask
+    return x.cwiseProduct(dropout_mask) / (1.0f - rate);
 }
 
 // ==================== GCNModel 实现 ====================
 
-GCNModel::GCNModel(int input_dim, int hidden_dim, int output_dim, float dropout)
-    : input_dim(input_dim), hidden_dim(hidden_dim), output_dim(output_dim) {
-    layer1 = std::make_unique<GCNLayer>(input_dim, hidden_dim, true, dropout);
-    layer2 = std::make_unique<GCNLayer>(hidden_dim, output_dim, true, dropout);
+GCNModel::GCNModel(int input_dim, int hidden_dim, int output_dim, float dropout, unsigned int seed)
+    : input_dim(input_dim), hidden_dim(hidden_dim), output_dim(output_dim),
+      global_rng(seed) {  // 初始化全局随机数生成器
+    // 所有层共享同一个全局 RNG（与 Python 版本一致）
+    // Layer 1: 使用 ReLU 激活
+    layer1 = std::make_unique<GCNLayer>(input_dim, hidden_dim, global_rng, true, dropout, true);
+    // Layer 2: 不使用 ReLU（identity activation，与 Python 的 act=lambda x: x 一致）
+    layer2 = std::make_unique<GCNLayer>(hidden_dim, output_dim, global_rng, true, dropout, false);
 }
 
 MatrixXf GCNModel::forward(const SparseMatrix<float>& adj_norm, 

@@ -11,13 +11,36 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <filesystem>
 
 using namespace Eigen;
 using namespace std;
+namespace fs = std::filesystem;
 
 // ==================== Trainer 实现 ====================
 
-void Trainer::load_tasks_info(const std::string& memory_flops_path) {
+static std::string resolve_memory_flops_path(const std::string& dataset) {
+    std::vector<std::string> candidates = {
+        "results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt",
+        "../results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt",
+        "../../results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt",
+        "gcn/results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt",
+        "../gcn/results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt"
+    };
+    for (const auto& p : candidates) {
+        if (fs::exists(fs::path(p))) return p;
+    }
+    return "";
+}
+
+void Trainer::load_tasks_info(const std::string& dataset) {
+    std::string memory_flops_path = resolve_memory_flops_path(dataset);
+    if (memory_flops_path.empty()) {
+        std::cerr << "Warning: memory_flops_epochs.txt not found for dataset " << dataset
+                  << ". Using default task value 1.0 (all PNM)." << std::endl;
+        return;
+    }
+
     std::ifstream file(memory_flops_path);
     if (!file.is_open()) {
         std::cerr << "Warning: Cannot open " << memory_flops_path << std::endl;
@@ -91,10 +114,7 @@ void Trainer::initialize() {
     }
     
     // 4. 加载任务信息
-    std::string base_dir = ".";  // TODO: 获取实际路径
-    std::string memory_flops_path = base_dir + "/results/" + config.dataset + 
-                                   "/l1_cache_analysis/memory_flops_epochs.txt";
-    load_tasks_info(memory_flops_path);
+    load_tasks_info(config.dataset);
 }
 
 MatrixXf Trainer::exec_stage(
@@ -189,10 +209,11 @@ void Trainer::train() {
         
         // 初始化模型
         GCNModel model(
-            features.cols(),  // input_dim
-            config.hidden1,   // hidden_dim
+            features.cols(),              // input_dim
+            config.hidden1,               // hidden_dim
             subgraph.y_train_sub.cols(),  // output_dim
-            config.dropout
+            config.dropout,
+            static_cast<unsigned int>(config.seed)
         );
         
         // 初始化优化器
@@ -234,10 +255,9 @@ void Trainer::train() {
                 outputs, subgraph.y_train_sub, subgraph.train_mask_sub);
             
             // 添加 L2 正则化
+            // 与原 TF 版本保持一致：仅对第一层权重做 L2 正则（embedding 层）
             train_loss += LossFunctions::l2_loss(
                 model.get_layer1()->get_weight(), config.weight_decay);
-            train_loss += LossFunctions::l2_loss(
-                model.get_layer2()->get_weight(), config.weight_decay);
             
             // 反向传播
             MatrixXf grad_output = BackwardPropagator::compute_loss_gradient(
@@ -257,7 +277,7 @@ void Trainer::train() {
             MatrixXf grad_features;
             BackwardPropagator::backward_layer1_update(
                 grad_layer1, features, model.get_layer1(), 
-                grad_features, optimizer, 0);
+                grad_features, optimizer, 0, config.weight_decay);
             
             // 验证
             TrainingStats val_stats = evaluate(model, subgraph, adj_norm);
@@ -275,8 +295,13 @@ void Trainer::train() {
                       << " time=" << std::setprecision(5) << duration << std::endl;
             
             // Early stopping
-            if (epoch > config.early_stopping &&
+            // 与 Python 版本完全一致：
+            // Python: if epoch > FLAGS.early_stopping and cost_val[-1] > np.mean(cost_val[-(FLAGS.early_stopping+1):-1])
+            // 逻辑：从第 (early_stopping + 1) 个 epoch 开始，如果当前验证损失大于最近 early_stopping 个 epoch 的平均值，则停止
+            if (epoch > config.early_stopping && 
                 cost_val.size() > static_cast<size_t>(config.early_stopping + 1)) {
+                // cost_val[-(early_stopping+1):-1] 表示从倒数第 (early_stopping+1) 个到倒数第 2 个
+                // 即最近 early_stopping 个 epoch（不包括当前 epoch）
                 float recent_avg = std::accumulate(
                     cost_val.end() - config.early_stopping - 1, 
                     cost_val.end() - 1, 0.0f) / config.early_stopping;
@@ -296,7 +321,7 @@ void Trainer::train() {
         all_subgraph_results.push_back({subgraph.part_nodes, y_pred_sub});
     }
     
-    print_statistics();
+    // print_statistics(); // 暂时屏蔽调度日志输出，避免刷屏
 }
 
 void Trainer::print_statistics() const {

@@ -28,6 +28,7 @@ public:
         const SparseMatrix<float>& adj_norm);
     
     // Layer 2 Update 反向传播
+    // 注意：第二层不使用 L2 正则（与 Python 版本一致）
     static void backward_layer2_update(
         const MatrixXf& grad_output,
         const MatrixXf& layer1_agg,
@@ -48,7 +49,8 @@ public:
         GCNLayer* layer1,
         MatrixXf& grad_features,
         AdamOptimizer& optimizer,
-        int param_index);
+        int param_index,
+        float weight_decay);
 };
 
 #endif // BACKWARD_H

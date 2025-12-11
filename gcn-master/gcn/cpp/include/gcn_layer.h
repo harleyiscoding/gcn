@@ -21,14 +21,19 @@ protected:
     bool use_bias;
     float dropout_rate;
     bool training;
+    bool use_relu;                          // 是否使用 ReLU 激活（第二层不使用）
+    MatrixXf last_linear;                   // 前激活值（ReLU 之前）
+    MatrixXf relu_mask;                     // ReLU 掩码
+    MatrixXf dropout_mask;                  // Dropout 掩码（0/1）
     
-    // 随机数生成器（用于 dropout）
-    std::mt19937 rng;
+    // 随机数生成器（用于 dropout 和权重初始化）
+    // 使用引用，让所有层共享同一个全局 RNG（与 Python 版本一致）
+    std::mt19937& rng;
     std::uniform_real_distribution<float> dropout_dist;
     
 public:
-    GCNLayer(int input_dim, int output_dim, bool use_bias = true, 
-             float dropout = 0.0f, unsigned int seed = 42);
+    GCNLayer(int input_dim, int output_dim, std::mt19937& rng_ref,
+             bool use_bias = true, float dropout = 0.0f, bool use_relu = true);
     
     virtual ~GCNLayer() = default;
     
@@ -44,12 +49,16 @@ public:
     
     // 设置训练模式
     void set_training(bool is_training) { training = is_training; }
+    bool is_training() const { return training; }
+    float get_dropout_rate() const { return dropout_rate; }
     
     // 获取/设置权重（用于反向传播）
     MatrixXf& get_weight() { return weight; }
     VectorXf& get_bias() { return bias; }
     const MatrixXf& get_weight() const { return weight; }
     const VectorXf& get_bias() const { return bias; }
+    const MatrixXf& get_relu_mask() const { return relu_mask; }
+    const MatrixXf& get_dropout_mask() const { return dropout_mask; }
     
     // 初始化权重（Xavier 初始化）
     void initialize_weights(int input_dim, int output_dim);
@@ -72,9 +81,12 @@ private:
     int hidden_dim;
     int output_dim;
     
+    // 全局随机数生成器（所有层共享，与 Python 版本一致）
+    std::mt19937 global_rng;
+    
 public:
     GCNModel(int input_dim, int hidden_dim, int output_dim, 
-             float dropout = 0.5f);
+             float dropout = 0.5f, unsigned int seed = 42);
     
     // 前向传播：执行完整的 GCN 前向传播
     // 返回：logits [num_nodes, output_dim]
