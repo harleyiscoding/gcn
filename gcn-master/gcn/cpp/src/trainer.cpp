@@ -4,6 +4,7 @@
  */
 
 #include "../include/trainer.h"
+#include "zsim_hooks.h"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -11,24 +12,54 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
-#include <filesystem>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cstdlib>
 
 using namespace Eigen;
 using namespace std;
-namespace fs = std::filesystem;
 
 // ==================== Trainer 实现 ====================
+
+// 检查文件是否存在的辅助函数（兼容旧版 GCC）
+static bool file_exists(const std::string& path) {
+    struct stat buffer;
+    return (stat(path.c_str(), &buffer) == 0);
+}
 
 static std::string resolve_memory_flops_path(const std::string& dataset) {
     std::vector<std::string> candidates = {
         "results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt",
         "../results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt",
         "../../results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt",
+        "../../../results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt",
         "gcn/results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt",
-        "../gcn/results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt"
+        "../gcn/results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt",
+        "../../gcn/results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt",
+        "../../../gcn/results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt"
     };
+    
+    // 尝试从环境变量获取基础路径
+    const char* base_path = std::getenv("HLEXPERIENCE_ROOT");
+    if (base_path) {
+        std::string base(base_path);
+        candidates.push_back(base + "/gcnex/gcn-master/gcn/results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt");
+    }
+    
+    // Docker 和宿主机常见路径
+    candidates.push_back("/workspace/hlexperience/gcnex/gcn-master/gcn/results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt");
+    candidates.push_back("/home/wanyu/hlexperience/gcnex/gcn-master/gcn/results/" + dataset + "/l1_cache_analysis/memory_flops_epochs.txt");
+    
+    std::cout << "[TaskInfo] 查找任务信息文件: " << dataset << std::endl;
     for (const auto& p : candidates) {
-        if (fs::exists(fs::path(p))) return p;
+        if (file_exists(p)) {
+            std::cout << "[TaskInfo] 找到文件: " << p << std::endl;
+            return p;
+        }
+    }
+    std::cerr << "[TaskInfo] 警告: 未找到任务信息文件，尝试的路径:" << std::endl;
+    for (const auto& p : candidates) {
+        std::cerr << "  - " << p << (file_exists(p) ? " (存在)" : " (不存在)") << std::endl;
     }
     return "";
 }
@@ -36,20 +67,23 @@ static std::string resolve_memory_flops_path(const std::string& dataset) {
 void Trainer::load_tasks_info(const std::string& dataset) {
     std::string memory_flops_path = resolve_memory_flops_path(dataset);
     if (memory_flops_path.empty()) {
-        std::cerr << "Warning: memory_flops_epochs.txt not found for dataset " << dataset
+        std::cerr << "[TaskInfo] 警告: memory_flops_epochs.txt not found for dataset " << dataset
                   << ". Using default task value 1.0 (all PNM)." << std::endl;
         return;
     }
 
+    std::cout << "[TaskInfo] 读取任务信息文件: " << memory_flops_path << std::endl;
     std::ifstream file(memory_flops_path);
     if (!file.is_open()) {
-        std::cerr << "Warning: Cannot open " << memory_flops_path << std::endl;
+        std::cerr << "[TaskInfo] 警告: Cannot open " << memory_flops_path << std::endl;
         return;
     }
     
     std::string line;
     std::getline(file, line);  // 跳过表头
+    std::cout << "[TaskInfo] 表头: " << line << std::endl;
     
+    int loaded_count = 0;
     while (std::getline(file, line)) {
         std::istringstream iss(line);
         std::string token;
@@ -78,30 +112,49 @@ void Trainer::load_tasks_info(const std::string& dataset) {
             tasks_info.push_back({1, "AGG", amir1});
             tasks_info.push_back({2, "UPDATE", cd2});
             tasks_info.push_back({2, "AGG", amir2});
-        } catch (...) {
+            loaded_count++;
+            
+            std::cout << "[TaskInfo] Epoch " << loaded_count << ": "
+                      << "L1_UPDATE(CD=" << cd1 << "), L1_AGG(AMIR=" << amir1 << "), "
+                      << "L2_UPDATE(CD=" << cd2 << "), L2_AGG(AMIR=" << amir2 << ")" << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[TaskInfo] 解析错误: " << e.what() << " (行: " << line << ")" << std::endl;
             continue;
         }
     }
+    
+    std::cout << "[TaskInfo] 成功加载 " << loaded_count << " 个 epoch 的任务信息，共 " 
+              << tasks_info.size() << " 个任务" << std::endl;
 }
 
 void Trainer::initialize() {
     // 1. 加载数据
-    std::string data_dir = "../data";  // 相对于可执行文件的路径
+    std::cout << "[初始化] 开始加载数据..." << std::endl;
+    std::string data_dir = "../data";  // 初始路径，DataLoader 会尝试多个候选路径
     graph_data = DataLoader::load_data(config.dataset, data_dir);
+    
+    std::cout << "[初始化] 数据加载完成: " << graph_data.num_nodes << " 节点, " 
+              << graph_data.num_features << " 特征, " << graph_data.num_classes << " 类" << std::endl;
     
     if (graph_data.num_nodes == 0) {
         throw std::runtime_error("Failed to load data. Please implement data loading or use preprocessed data.");
     }
     
     // 2. 图分区
+    std::cout << "[初始化] 开始图分区 (METIS)..." << std::endl;
     std::vector<int> part_labels = PartitionUtils::metis_partition(
         graph_data.adj, config.num_parts);
+    std::cout << "[初始化] 图分区完成" << std::endl;
     
     std::vector<std::vector<int>> partition_masks = 
         PartitionUtils::get_partition_masks(part_labels, config.num_parts);
+    std::cout << "[初始化] 分区掩码生成完成: " << partition_masks.size() << " 个分区" << std::endl;
     
     // 3. 提取子图
-    for (const auto& mask : partition_masks) {
+    std::cout << "[初始化] 开始提取子图..." << std::endl;
+    for (size_t i = 0; i < partition_masks.size(); i++) {
+        const auto& mask = partition_masks[i];
+        std::cout << "[初始化] 提取分区 " << i << " (" << mask.size() << " 节点)..." << std::endl;
         SubgraphData subgraph = PartitionUtils::extract_subgraph(graph_data, mask);
         
         // 预处理子图
@@ -112,9 +165,12 @@ void Trainer::initialize() {
         
         subgraph_list.push_back(subgraph);
     }
+    std::cout << "[初始化] 子图提取完成: " << subgraph_list.size() << " 个子图" << std::endl;
     
     // 4. 加载任务信息
+    std::cout << "[初始化] 加载任务信息..." << std::endl;
     load_tasks_info(config.dataset);
+    std::cout << "[初始化] 初始化完成，准备开始训练" << std::endl;
 }
 
 MatrixXf Trainer::exec_stage(
@@ -153,8 +209,15 @@ MatrixXf Trainer::exec_stage(
     log.device = device;
     stage_device_log.push_back(log);
     
-    // 执行计算
+    // 执行计算（为 PIM/PNM 任务添加 ZSim 跟踪）
     MatrixXf result;
+    
+    // 如果是 PIM 或 PNM 任务，使用 ZSim hooks 跟踪
+    bool is_pim_pnm = (device == "PIM" || device == "PNM");
+    if (is_pim_pnm) {
+        zsim_PIM_function_begin();
+    }
+    
     if (phase == "UPDATE") {
         if (layer_idx == 1) {
             result = model.layer1_update(input_data);
@@ -167,6 +230,11 @@ MatrixXf Trainer::exec_stage(
         } else {
             result = model.layer2_aggregate(adj_norm, input_data);
         }
+    }
+    
+    // 结束 PIM/PNM 任务跟踪
+    if (is_pim_pnm) {
+        zsim_PIM_function_end();
     }
     
     std::cout << "[完成] Layer " << layer_idx << " " << phase 
@@ -230,8 +298,14 @@ void Trainer::train() {
             
             std::cout << "\n=== Partition " << part_id << " Epoch " << (epoch + 1) << " ===" << std::endl;
             
+            // 每 10 个 epoch 输出一次调度器统计信息
+            if ((epoch + 1) % 10 == 0 || epoch == 0) {
+                scheduler.print_statistics();
+            }
+            
             model.set_training(true);
             
+            // 前向传播阶段（包含 PIM/PNM 任务，由 zsim_PIM_function_begin/end 标记）
             // Layer 1 Update
             MatrixXf updated = exec_stage(
                 1, "UPDATE", epoch, static_cast<int>(part_id), model, adj_norm, features);

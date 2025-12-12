@@ -8,6 +8,7 @@
 #include <iostream>
 #include <cstring>
 #include <omp.h>
+#include "zsim_hooks.h"
 
 // 解析命令行参数
 GCNConfig parse_args(int argc, char* argv[]) {
@@ -60,8 +61,14 @@ int main(int argc, char* argv[]) {
     Trainer trainer(config);
     
     try {
+        // 初始化不在 ROI 内（数据加载、图分区等不需要详细跟踪）
         trainer.initialize();
+        
+        // 开始 ZSim ROI 跟踪（只跟踪训练循环中的计算）
+        zsim_roi_begin();
         trainer.train();
+        // 结束 ZSim ROI 跟踪
+        zsim_roi_end();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;
