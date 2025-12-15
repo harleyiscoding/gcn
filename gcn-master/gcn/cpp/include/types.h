@@ -24,7 +24,7 @@ struct GCNConfig {
     int hidden1 = 16;
     float dropout = 0.5f;
     float weight_decay = 5e-4f;
-    int early_stopping = 200;              // 早停容忍度：与 Python 版本一致
+    int early_stopping = 20;              // 早停容忍度：与 Python 版本一致
                                           // 从第 (early_stopping + 1) 个 epoch 开始检查，如果当前验证损失大于最近 early_stopping 个 epoch 的平均值则停止
                                           // 设置为 >= epochs 的值可禁用早停（如 200 表示训练 200 个 epoch 时不会触发早停）
     int max_degree = 3;
